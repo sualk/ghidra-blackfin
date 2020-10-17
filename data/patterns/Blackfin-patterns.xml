@@ -1,0 +1,10 @@
+<patternlist>
+    <pattern>
+        <data> 0x19 0xe5 0x.... 0x1b 0xe5 0x.... 0x51 0x00 </data>
+        <!-- P1 = [P3 + 0x....]
+             P3 = [P3 + 0x....]
+             jump (P1)
+        -->
+        <funcstart validcode="function" thunk="true"/>
+    </pattern>
+</patternlist>

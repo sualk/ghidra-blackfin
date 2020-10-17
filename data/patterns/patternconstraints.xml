@@ -1,0 +1,5 @@
+<patternconstraints>
+  <language id="Blackfin:LE:32:*">
+    <patternfile>Blackfin-patterns.xml</patternfile>
+  </language>
+</patternconstraints>
