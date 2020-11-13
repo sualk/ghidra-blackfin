@@ -699,7 +699,7 @@ Mv_dest: destreg_7 is destreg_7 & destgrp=7 { export destreg_7; }
 :SUB Dreg6 = Dreg0 - Dreg3 is op4=0x5 & opc0911=1 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 - Dreg3; }
 :AND Dreg6 = Dreg0 & Dreg3 is op4=0x5 & opc0911=2 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 & Dreg3; }
 :OR  Dreg6 = Dreg0 | Dreg3 is op4=0x5 & opc0911=3 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 | Dreg3; }
-:XOR Dreg6 = Dreg0 ^ Dreg3 is op4=0x5 & opc0911=4 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 ^ Dreg3; }
+:XOR Dreg6 = Dreg0 "^" Dreg3 is op4=0x5 & opc0911=4 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 ^ Dreg3; }
 :ADD Preg6 = Preg0 + Preg3 is op4=0x5 & opc0911=5 & Preg6 & Preg3 & Preg0 { Preg6 = Preg0 + Preg3; }
 :ADD Preg6 = Preg0 + (Preg3 << 1) is op4=0x5 & opc0911=6 & Preg6 & Preg3 & Preg0 { Preg6 = Preg0 + Preg3*2; }
 :ADD Preg6 = Preg0 + (Preg3 << 2) is op4=0x5 & opc0911=7 & Preg6 & Preg3 & Preg0 { Preg6 = Preg0 + Preg3*4; }
