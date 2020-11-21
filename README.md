@@ -22,9 +22,16 @@ Most of the DSP instructions are not implemented.
 
 From all the status flags only the CC flag is implemented.
 
-Parallel execution of one 32bit instruction and two 16bit instructions is only marked with '||' at the mnenomic of the 32bit instruction but otherwise not handled.
+Parallel execution of one 32-bit instruction and two 16-bit instructions is only marked with '||' at the mnenomic of the 32-bit instruction but otherwise not handled.
+This is not perfect as the result may be wrong depending on the source and destination registers used.
 
-Hardware loops are not handled.
+    R1 = R0 -|- R2 || [FP + 36] = R1 || NOP;
+
+`R1` is destination in the first instruction and source in the second instruction.
+With the current implementation the second instruction uses the result from the first, but on real hardware it would use the unmodified value.
+
+Hardware loops are only handled if the loop is initialized with an `LSETUP` instruction. Further the setup instruction and the end of the loop needs to be disassembled in one step.
+Manually setting the loop registers is currently not handled.
 
 
 ## Installation
