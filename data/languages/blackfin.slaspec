@@ -1056,9 +1056,35 @@ PAIR1: "R1:0" is xreg0=0 unimpl
 PAIR1: "R3:2" is xreg0=2 unimpl
 
 :ADD^p    xreg9 = xreg3 +|+ xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=0 & SX & xreg9 & xreg3 & xreg0 unimpl
+:ADD^p    xreg9 = xreg3 +|+ xreg0
+    is p & op0610=0x10 & aopc0004=0 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg9_h & xreg9_l & xreg3 & xreg3_h & xreg3_l & xreg0 & xreg0_h & xreg0_l
+{
+    xreg9_l = xreg3_l + xreg0_l;
+    xreg9_h = xreg3_h + xreg0_h;
+}
+:ADD^p    xreg9 = xreg3 +|+ xreg0 "(co)"
+    is p & op0610=0x10 & aopc0004=0 ; xaop1415=0 & xsx1213=1 & xreg9 & xreg9_h & xreg9_l & xreg3 & xreg3_h & xreg3_l & xreg0 & xreg0_h & xreg0_l
+{
+    local tmp:2 = xreg3_l + xreg0_l;
+    xreg9_l = xreg3_h + xreg0_h;
+    xreg9_h = tmp;
+}
 :ADDSUB^p xreg9 = xreg3 +|- xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=1 & SX & xreg9 & xreg3 & xreg0 unimpl
 :ADDSUB^p xreg9 = xreg3 -|+ xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=2 & SX & xreg9 & xreg3 & xreg0 unimpl
 :SUB^p    xreg9 = xreg3 -|- xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=3 & SX & xreg9 & xreg3 & xreg0 unimpl
+:SUB^p    xreg9 = xreg3 -|- xreg0
+    is p & op0610=0x10 & aopc0004=0 ; xaop1415=3 & xsx1213=0 & xreg9 & xreg9_h & xreg9_l & xreg3 & xreg3_h & xreg3_l & xreg0 & xreg0_h & xreg0_l
+{
+    xreg9_l = xreg3_l - xreg0_l;
+    xreg9_h = xreg3_h - xreg0_h;
+}
+:SUB^p    xreg9 = xreg3 -|- xreg0 "(co)"
+    is p & op0610=0x10 & aopc0004=0 ; xaop1415=3 & xsx1213=1 & xreg9 & xreg9_h & xreg9_l & xreg3 & xreg3_h & xreg3_l & xreg0 & xreg0_h & xreg0_l
+{
+    local tmp:2 = xreg3_l - xreg0_l;
+    xreg9_l = xreg3_h - xreg0_h;
+    xreg9_h = tmp;
+}
 
 :ADDSUB^p xreg6 = xreg3 +|+ xreg0, xreg9 = xreg3_2 -|- xreg0_2 SXA is p & op0610=0x10 & hl05=0 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 unimpl
 :ADDSUB^p xreg6 = xreg3 +|- xreg0, xreg9 = xreg3_2 -|+ xreg0_2 SXA is p & op0610=0x10 & hl05=1 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 unimpl
@@ -1212,10 +1238,31 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 :ROT^p A0 = "rot" "A0" "by" xreg3_l    is p & op0410=0x60 & sopc0003=3 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & A0 unimpl
 :ROT^p A1 = "rot" "A1" "by" xreg3_l    is p & op0410=0x60 & sopc0003=3 ; xsop1415=2 & xhls1213=1 & xreg6=0 & xreg3_l & A1 unimpl
 
-:PACK^p xreg9 = "pack"(xreg0_l, xreg3_l) is p & op0410=0x60 & sopc0003=4 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_l & xreg0_l unimpl
-:PACK^p xreg9 = "pack"(xreg0_l, xreg3_h) is p & op0410=0x60 & sopc0003=4 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_h & xreg0_l unimpl
-:PACK^p xreg9 = "pack"(xreg0_h, xreg3_l) is p & op0410=0x60 & sopc0003=4 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_l & xreg0_h unimpl
-:PACK^p xreg9 = "pack"(xreg0_h, xreg3_h) is p & op0410=0x60 & sopc0003=4 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_h & xreg0_h unimpl
+:PACK^p xreg9 = "pack"(xreg0_l, xreg3_l)
+    is p & op0410=0x60 & sopc0003=4 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg9_h & xreg9_l & xreg3_l & xreg0_l
+{
+    xreg9_h = xreg0_l;
+    xreg9_l = xreg3_l;
+}
+:PACK^p xreg9 = "pack"(xreg0_l, xreg3_h)
+    is p & op0410=0x60 & sopc0003=4 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9 & xreg9_h & xreg9_l & xreg3_h & xreg0_l
+{
+    local tmp:2 = xreg3_h;
+    xreg9_h = xreg0_l;
+    xreg9_l = tmp;
+}
+:PACK^p xreg9 = "pack"(xreg0_h, xreg3_l)
+    is p & op0410=0x60 & sopc0003=4 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg9_h & xreg9_l & xreg3_l & xreg0_h
+{
+    xreg9_h = xreg0_h;
+    xreg9_l = xreg3_l;
+}
+:PACK^p xreg9 = "pack"(xreg0_h, xreg3_h)
+    is p & op0410=0x60 & sopc0003=4 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9 & xreg9_h & xreg9_l & xreg3_h & xreg0_h
+{
+    xreg9_l = xreg3_h;
+    xreg9_h = xreg0_h;
+}
 
 :SIGN^p xreg9_l = "signbits" xreg0   is p & op0410=0x60 & sopc0003=5 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 unimpl
 :SIGN^p xreg9_l = "signbits" xreg0_l is p & op0410=0x60 & sopc0003=5 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0_l unimpl
@@ -1269,8 +1316,20 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 :ASH^p xreg9 = xreg0 >>> shift "(v)"   is p & op0410=0x68 & sopc0003=1 ; xsop1415=0 & xhls1213=0 &            dimm603 & xreg9 & xreg0 [shift = -dimm603;] unimpl
 :ASH^p xreg9 = xreg0 << shift "(v,s)"  is p & op0410=0x68 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] unimpl
 :ASH^p xreg9 = xreg0 >>> shift "(v,s)" is p & op0410=0x68 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;] unimpl
-:LSH^p xreg9 = xreg0 << shift "(v)"    is p & op0410=0x68 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] unimpl
-:LSH^p xreg9 = xreg0 >> shift "(v)"    is p & op0410=0x68 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;] unimpl
+:LSH^p xreg9 = xreg0 << shift "(v)"
+    is p & op0410=0x68 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg9_l & xreg9_h & xreg0 & xreg0_l & xreg0_h
+    [shift = dimm603+0;]
+{
+    xreg9_h = xreg0_h << shift;
+    xreg9_l = xreg0_l << shift;
+}
+:LSH^p xreg9 = xreg0 >> shift "(v)"
+    is p & op0410=0x68 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg9_l & xreg9_h & xreg0 & xreg0_l & xreg0_h
+    [shift = -dimm603;]
+{
+    xreg9_h = xreg0_h >> shift;
+    xreg9_l = xreg0_l >> shift;
+}
 
 :ASH^p xreg9 = xreg0 >>> shift       is p & op0410=0x68 & sopc0003=2 ; xsop1415=0 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;] { xreg9 = xreg0 s>> shift; }
 :ASH^p xreg9 = xreg0 << shift "(s)"  is p & op0410=0x68 & sopc0003=2 ; xsop1415=1 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] { xreg9 = xreg0 << shift; }
