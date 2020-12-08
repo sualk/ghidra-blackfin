@@ -6,6 +6,8 @@ define alignment=2;
 define space ram type=ram_space size=4 default;
 define space register type=register_space size=2;
 
+@define IMASK "0xffe02104"
+
 # Data registers
 define register offset=0 size=4
     [R0        R1        R2        R3       R4         R5        R6        R7];
@@ -279,6 +281,8 @@ define token inst2(16)
     xh10 = (9,9)
     xop01112 = (11,12)
     xsop1415 = (14,15)
+    xop14 = (14,14)
+    xop15 = (15,15)
     xhls1213 = (12,13)
     xh13 = (13,13)
     xh12 = (12,12)
@@ -364,6 +368,17 @@ macro pop(reg) {
     SP = SP + 4;
 }
 
+define pcodeop idle;
+define pcodeop csync;
+define pcodeop ssync;
+define pcodeop raise;
+define pcodeop excpt;
+
+define pcodeop prefetch;
+define pcodeop flushinv;
+define pcodeop flush;
+define pcodeop iflush;
+
 
 # Mark parallel instructions at the 32bit opcode and use delayslot to include the next two instructions.
 # This is not perfect as the result may be wrong depending on the source and destination registers used.
@@ -432,20 +447,29 @@ with : phase=1 {
 :RTX        is op16=0x12 { return [RETX]; }
 :RTN        is op16=0x13 { return [RETN]; }
 :RTE        is op16=0x14 { return [RETE]; }
-:IDLE       is op16=0x20 unimpl
-:CSYNC      is op16=0x23 unimpl
-:SSYNC      is op16=0x24 unimpl
+:IDLE       is op16=0x20 { idle(); }
+:CSYNC      is op16=0x23 { csync(); }
+:SSYNC      is op16=0x24 { ssync(); }
 :EMUEXCPT   is op16=0x25 unimpl
 :ABORT      is op16=0x2f unimpl
-:CLI Dreg0  is op8=0x0 & opc0407=3 & x03=0 & Dreg0 unimpl
-:STI Dreg0  is op8=0x0 & opc0407=4 & x03=0 & Dreg0 unimpl
+:CLI Dreg0  is op8=0x0 & opc0407=3 & x03=0 & Dreg0
+{
+    local tmp:4 = $(IMASK);
+    Dreg0 = *[ram]:4 tmp;
+    *[ram]:4 tmp = 0;
+}
+:STI Dreg0  is op8=0x0 & opc0407=4 & x03=0 & Dreg0
+{
+    local tmp:4 = $(IMASK);
+    *[ram]:4 tmp = Dreg0;
+}
 
 :JUMP (Preg0)        is op8=0 & opc0407=0x5 & x03=0 & Preg0 { goto [Preg0]; }
 :CALL (Preg0)        is op8=0 & opc0407=0x6 & x03=0 & Preg0 { RETS = inst_next; call [Preg0]; }
 :CALL ("PC" + Preg0) is op8=0 & opc0407=0x7 & x03=0 & Preg0 unimpl
 :JUMP ("PC" + Preg0) is op8=0 & opc0407=0x8 & x03=0 & Preg0 unimpl
-:RAISE uimm4         is op8=0 & opc0407=0x9 & uimm4         unimpl
-:EXCPT uimm4         is op8=0 & opc0407=0xa & uimm4         unimpl
+:RAISE uimm4         is op8=0 & opc0407=0x9 & uimm4         { raise(uimm4:1); }
+:EXCPT uimm4         is op8=0 & opc0407=0xa & uimm4         { excpt(uimm4:1); }
 :TESTSET (Preg0)     is op8=0 & opc0407=0xb & x03=0 & Preg0 unimpl
 
 
@@ -492,10 +516,10 @@ CCreg: "CC" is epsilon { export CCflag; }
 CachePreg: Preg0   is a05=0 & Preg0 { export Preg0; }
 CachePreg: Preg0++ is a05=1 & Preg0 { local tmp:4 = Preg0; Preg0 = Preg0 + 32; export tmp; }
 
-:PREFETCH [CachePreg]  is op10=0x9 & opc0304=0 & CachePreg { build CachePreg; }
-:FLUSHINV [CachePreg]  is op10=0x9 & opc0304=1 & CachePreg { build CachePreg; }
-:FLUSH [CachePreg]     is op10=0x9 & opc0304=2 & CachePreg { build CachePreg; }
-:IFLUSH [CachePreg]    is op10=0x9 & opc0304=3 & CachePreg { build CachePreg; }
+:PREFETCH [CachePreg]  is op10=0x9 & opc0304=0 & CachePreg { prefetch(CachePreg); }
+:FLUSHINV [CachePreg]  is op10=0x9 & opc0304=1 & CachePreg { flushinv(CachePreg); }
+:FLUSH [CachePreg]     is op10=0x9 & opc0304=2 & CachePreg { flush(CachePreg); }
+:IFLUSH [CachePreg]    is op10=0x9 & opc0304=3 & CachePreg { iflush(CachePreg); }
 
 
 #####
@@ -1104,6 +1128,12 @@ SAT: "(s)"  is xs13=1 unimpl
 DDST0: xreg9_h is hl05=1 ; xreg9_h { export xreg9_h; }
 DDST0: xreg9_l is hl05=0 ; xreg9_l { export xreg9_l; }
 
+DSRC0: xreg3_l is xop15=0 & xreg3_l { export xreg3_l; }
+DSRC0: xreg3_h is xop15=1 & xreg3_h { export xreg3_h; }
+
+DSRC1: xreg0_l is xop14=0 & xreg0_l { export xreg0_l; }
+DSRC1: xreg0_h is xop14=1 & xreg0_h { export xreg0_h; }
+
 PAIR0: "R1:0" is xreg3=0 unimpl
 PAIR0: "R3:2" is xreg3=2 unimpl
 
@@ -1148,18 +1178,37 @@ PAIR1: "R3:2" is xreg0=2 unimpl
 :ADDSUB^p xreg6 = xreg3 +|+ xreg0, xreg9 = xreg3_2 -|- xreg0_2 SXA is p & op0610=0x10 & hl05=0 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 unimpl
 :ADDSUB^p xreg6 = xreg3 +|- xreg0, xreg9 = xreg3_2 -|+ xreg0_2 SXA is p & op0610=0x10 & hl05=1 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 unimpl
 
-:ADD^p DDST0 = xreg3_l + xreg0_l SAT is (p & op0610=0x10 & aopc0004=2 ; xaop1415=0 & xx12=0 & SAT & xreg3_l & xreg0_l) & DDST0 unimpl
-:ADD^p DDST0 = xreg3_l + xreg0_h SAT is (p & op0610=0x10 & aopc0004=2 ; xaop1415=1 & xx12=0 & SAT & xreg3_l & xreg0_h) & DDST0 unimpl
-:ADD^p DDST0 = xreg3_h + xreg0_l SAT is (p & op0610=0x10 & aopc0004=2 ; xaop1415=2 & xx12=0 & SAT & xreg3_h & xreg0_l) & DDST0 unimpl
-:ADD^p DDST0 = xreg3_h + xreg0_h SAT is (p & op0610=0x10 & aopc0004=2 ; xaop1415=3 & xx12=0 & SAT & xreg3_h & xreg0_h) & DDST0 unimpl
+:ADD^p DDST0 = DSRC0 + DSRC1 "(s)" is (p & op0610=0x10 & aopc0004=2 ; xx12=0 & xs13=1 & DSRC0 & DSRC1) & DDST0 unimpl
+:ADD^p DDST0 = DSRC0 + DSRC1 "(ns)"
+    is (p & op0610=0x10 & aopc0004=2 ; xx12=0 & xs13=0 & DSRC0 & DSRC1) & DDST0
+{
+    DDST0 = DSRC0 + DSRC1;
+    build p;
+}
 
-:SUB^p DDST0 = xreg3_l - xreg0_l SAT is (p & op0610=0x10 & aopc0004=3 ; xaop1415=0 & xx12=0 & SAT & xreg3_l & xreg0_l) & DDST0 unimpl
-:SUB^p DDST0 = xreg3_l - xreg0_h SAT is (p & op0610=0x10 & aopc0004=3 ; xaop1415=1 & xx12=0 & SAT & xreg3_l & xreg0_h) & DDST0 unimpl
-:SUB^p DDST0 = xreg3_h - xreg0_l SAT is (p & op0610=0x10 & aopc0004=3 ; xaop1415=2 & xx12=0 & SAT & xreg3_h & xreg0_l) & DDST0 unimpl
-:SUB^p DDST0 = xreg3_h - xreg0_h SAT is (p & op0610=0x10 & aopc0004=3 ; xaop1415=3 & xx12=0 & SAT & xreg3_h & xreg0_h) & DDST0 unimpl
+:SUB^p DDST0 = DSRC0 - DSRC1 "(s)" is (p & op0610=0x10 & aopc0004=3 ; xx12=0 & xs13=1 & DSRC0 & DSRC1) & DDST0 unimpl
+:SUB^p DDST0 = DSRC0 - DSRC1 "(ns)"
+    is (p & op0610=0x10 & aopc0004=3 ; xx12=0 & xs13=0 & DSRC0 & DSRC1) & DDST0
+{
+    DDST0 = DSRC0 - DSRC1;
+    build p;
+}
 
-:ADD^p xreg9 = xreg3 + xreg0 SAT is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=0 & xx12=0 & SAT & xreg9 & xreg3 & xreg0 unimpl
-:SUB^p xreg9 = xreg3 - xreg0 SAT is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=1 & xx12=0 & SAT & xreg9 & xreg3 & xreg0 unimpl
+:ADD^p xreg9 = xreg3 + xreg0 "(s)" is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=0 & xx12=0 & xs13=1 & xreg9 & xreg3 & xreg0 unimpl
+:ADD^p xreg9 = xreg3 + xreg0 "(ns)"
+    is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=0 & xx12=0 & xs13=0 & xreg9 & xreg3 & xreg0
+{
+    xreg9 = xreg3 + xreg0;
+    build p;
+}
+:SUB^p xreg9 = xreg3 - xreg0 "(s)" is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=1 & xx12=0 & xs13=1 & xreg9 & xreg3 & xreg0 unimpl
+:SUB^p xreg9 = xreg3 - xreg0 "(ns)"
+    is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=1 & xx12=0 & xs13=0 & xreg9 & xreg3 & xreg0
+{
+    xreg9 = xreg3 - xreg0;
+    build p;
+}
+
 :ADDSUB^p xreg6 = xreg3 + xreg0, xreg9 = xreg3_2 - xreg0_2 SAT is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=2 & xx12=0 & SAT & xreg9 & xreg6 & xreg3_2 & xreg3 & xreg0_2 & xreg0 unimpl
 
 :ADD^p DDST0 = xreg3 + xreg0 "(rnd12)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0) & DDST0 unimpl
@@ -1181,8 +1230,9 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     ternary(xreg9, (xreg3 s< xreg0), xreg3, xreg0);
     build p;
 }
-:ABS^p xreg9 = "abs" xreg3         is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg3         unimpl
-:NEG^p xreg9 = -xreg3 SAT          is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=3 & xx12=0 & SAT & xreg9 & xreg3      unimpl
+:ABS^p xreg9 = "abs" xreg3   is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg3         unimpl
+:NEG^p xreg9 = -xreg3 "(s)"  is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=3 & xx12=0 & xs13=1 & xreg9 & xreg3   unimpl
+:NEG^p xreg9 = -xreg3 "(ns)" is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=3 & xx12=0 & xs13=0 & xreg9 & xreg3 { xreg9 = -xreg3; build p;}
 
 :CLR^p A0 = 0          is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=0 & xsx1213=0 & A0 { A0 = 0; build p;}
 :SAT^p A0 = "A0" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=0 & xsx1213=2 & A0 unimpl
@@ -1409,7 +1459,8 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 :ASH^p xreg9 = xreg0 >>> shift "(s)" is p & op0410=0x68 & sopc0003=2 ; xsop1415=1 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;] { xreg9 = xreg0 s>> shift; build p;}
 :LSH^p xreg9 = xreg0 << shift        is p & op0410=0x68 & sopc0003=2 ; xsop1415=2 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] { xreg9 = xreg0 << shift; build p;}
 :LSH^p xreg9 = xreg0 >> shift        is p & op0410=0x68 & sopc0003=2 ; xsop1415=2 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;]  { xreg9 = xreg0 >> shift; build p;}
-:ROT^p xreg9 = "rot" xreg0 "by" dimm603 is p & op0410=0x68 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & dimm603 & xreg9 & xreg0 unimpl
+:ROT^p xreg9 = "rot" xreg0 "by" 0       is p & op0410=0x68 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & dimm603=0 & xreg9 & xreg0 { xreg9 = xreg0; build p;}
+:ROT^p xreg9 = "rot" xreg0 "by" dimm603 is p & op0410=0x68 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & dimm603   & xreg9 & xreg0 unimpl
 
 :ASH^p A0 = "A0" >>> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & sign08=1 & dimm603 & A0 [shift = -dimm603;] unimpl
 :ASH^p A1 = "A1" >>> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & sign08=1 & dimm603 & A1 [shift = -dimm603;] unimpl
