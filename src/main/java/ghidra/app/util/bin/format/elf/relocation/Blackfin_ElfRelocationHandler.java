@@ -46,12 +46,12 @@ public class Blackfin_ElfRelocationHandler extends ElfRelocationHandler {
 		
 		switch (type) {
 			case Blackfin_ElfRelocationConstants.R_BFIN_FUNCDESC:
-				markAsWarning(program, relocationAddress, "R_BFIN_FUNCDESC", symbolName, symbolIndex,
-						"TODO, needs support ", elfRelocationContext.getLog());
+				memory.setInt(relocationAddress, (int)symbolValue);
 				break;
 				
 			case Blackfin_ElfRelocationConstants.R_BFIN_FUNCDESC_VALUE:
 				memory.setInt(relocationAddress, (int)symbolValue);
+				memory.setInt(relocationAddress.add(4), 0);
 				break;
 				
 			default:

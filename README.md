@@ -33,6 +33,9 @@ With the current implementation the second instruction uses the result from the 
 Hardware loops are only handled if the loop is initialized with an `LSETUP` instruction. Further the setup instruction and the end of the loop needs to be disassembled in one step.
 Manually setting the loop registers is currently not handled.
 
+### Loader
+Supports loading of Blackfin boot streams (`.ldr` files).
+
 
 ## Installation
 Use gradle to build extension: `GHIDRA_INSTALL_DIR=${GHIDRA_HOME} gradle` and use Ghidra to install it: `File → Install Extensions...`
