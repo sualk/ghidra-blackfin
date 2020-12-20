@@ -208,14 +208,21 @@ public class BlackfinLoader extends AbstractLibrarySupportLoader {
 			}
 			
 			if ((bh.flags & BlockHeader.BFLAG_FILL) != 0) {
-				if (bh.argument != 0) {
-					// TODO: Handle BFLAG_FILL blocks correctly
-					log.appendMsg("Fill block with non null fill data not yet supported.");
-				}
 				try {
 					MemoryBlock mem = program.getMemory().createInitializedBlock("block"+Integer.toString(i), target, bh.byteCount, (byte)0, monitor, false);
 					mem.setPermissions(true, true, true);
 					mem.setComment(bh.getComment());
+					
+					if (bh.argument != 0) {
+						Address pos = target;
+						byte[] b = {(byte)bh.argument, (byte)(bh.argument >> 8), (byte)(bh.argument >> 16), (byte)(bh.argument >> 24)};
+
+						do {
+							mem.putBytes(pos, b);
+							pos = pos.add(4);
+						} while (pos.getOffset() < target.add(bh.byteCount).getOffset());
+					}
+					
 				} catch (Exception e) {
 					Msg.error(this, e.getMessage());
 				}
