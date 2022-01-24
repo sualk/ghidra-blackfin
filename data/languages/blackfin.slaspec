@@ -291,6 +291,18 @@ define token inst2(16)
     xx12 = (12,12)
 ;
 
+define token inst3(16)
+    yuimm16 = (0,15)
+;
+
+define token inst4(16)
+    zuimm16 = (0,15)
+    zdreg0 = (0,2)
+    zpreg0 = (0,2)
+    zsz1011 = (10,11)
+    zw09 = (9,9)
+    zz06 = (6,6)
+;
 
 define context contextreg
     phase = (0,0)
@@ -311,6 +323,9 @@ attach variables [ xreg6_e ] [ R0 _ R2 _ R4 _ R6 _ ];
 attach variables [ Dreg_l0 Dreg_l3 Dreg_l6 xreg0_l xreg3_l xreg6_l xreg9_l ] [ R0.L R1.L R2.L R3.L R4.L R5.L R6.L R7.L];
 attach variables [ Dreg_h0 Dreg_h6 xreg0_h xreg3_h xreg6_h xreg9_h ] [ R0.H R1.H R2.H R3.H R4.H R5.H R6.H R7.H];
 attach variables [ Dreg_b3 ] [ R0.B R1.B R2.B R3.B R4.B R5.B R6.B R7.B];
+
+attach variables [ zdreg0 ] [ R0 R1 R2 R3 R4 R5 R6 R7];
+attach variables [ zpreg0 ] [ P0 P1 P2 P3 P4 P5 SP FP];
 
 attach variables [ AllReg ] [
     R0 R1 R2 R3 R4 R5 R6 R7
@@ -1476,6 +1491,54 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 
 :ROT^p A0 = "rot" "A0" "by" dimm603 is p & op0410=0x68 & sopc0003=3 ; xsop1415=2 & xhls1213=0 & dimm603 & A0  unimpl
 :ROT^p A1 = "rot" "A1" "by" dimm603 is p & op0410=0x68 & sopc0003=3 ; xsop1415=2 & xhls1213=1 & dimm603 & A1  unimpl
+
+
+#####
+# Load/store absolute 32bit
+#
+# +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
+# | 1 | 1 | 0 | 1 | 1 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+# |.imm31-16......................................................|
+# |.imm15-0.......................................................|
+# | 0 | 0 | 0 | 0 |.sz....|.w.| 0 | 0 |.z.| 0 | 0 | 0 |.reg.......|
+# +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
+
+LdStAbs_reg: zdreg0 is zdreg0                      { export zdreg0; }
+LdStAbs_reg: zpreg0 is zpreg0 & zsz1011=0 & zz06=1 { export zpreg0; }
+
+:LOAD  LdStAbs_reg = [value]  is op16=0xd800 ; uimm16 ; yuimm16 ; LdStAbs_reg            [value = uimm16 << 16 | yuimm16;] unimpl 
+:STORE [value] = LdStAbs_reg  is op16=0xd800 ; uimm16 ; yuimm16 ; zw09=1 & LdStAbs_reg   [value = uimm16 << 16 | yuimm16;] unimpl
+# TODO: Further modes and P-code implementation
+
+
+#####
+# Load Immediate 32bit
+#
+# +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
+# | 1 | 1 | 0 | 1 | 1 | 0 | 1 | 0 | 0 | 0 |.grp.......|.reg.......|
+# |.imm31-16......................................................|
+# |.imm15-0.......................................................|
+# |.dummy.(0).....................................................|
+# +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
+
+:LOAD AllReg = value is op10=0x368 & AllReg ; uimm16 ; yuimm16 ; zuimm16=0 [value = uimm16 << 16 | yuimm16;] { AllReg = value; }
+
+
+#####
+# Jump/Call Immediate 32bit
+#
+# +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
+# | 1 | 1 | 0 | 1 | 1 | 1 |.c.| 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |.r.|
+# |.imm31-16......................................................|
+# |.imm15-0.......................................................|
+# |.dummy.(0).....................................................|
+# +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
+
+:JUMP.a value is op16=0xdc00 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
+:JUMP   value is op16=0xdc01 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
+:CALL.a value is op16=0xde00 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
+:CALL   value is op16=0xde01 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
+# TODO: P-Code Implementation
 
 
 #####
