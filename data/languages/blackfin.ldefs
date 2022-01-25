@@ -17,6 +17,18 @@
   <language processor="Blackfin"
             endian="little"
             size="32"
+            variant="Blackfin+"
+            version="1.0"
+            slafile="blackfinplus.sla"
+            processorspec="blackfin.pspec"
+            id="blackfin:LE:32:blackfin+">
+    <description>Analog Devices Blackfin family</description>
+    <compiler name="default" spec="blackfin.cspec" id="default"/>
+  </language>
+
+  <language processor="Blackfin"
+            endian="little"
+            size="32"
             variant="BF52x"
             version="1.0"
             slafile="blackfin.sla"
