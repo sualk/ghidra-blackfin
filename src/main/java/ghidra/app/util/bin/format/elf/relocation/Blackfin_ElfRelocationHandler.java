@@ -8,6 +8,8 @@ import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.reloc.Relocation.Status;
+import ghidra.program.model.reloc.RelocationResult;
 import ghidra.util.exception.NotFoundException;
 
 public class Blackfin_ElfRelocationHandler extends ElfRelocationHandler {
@@ -18,12 +20,12 @@ public class Blackfin_ElfRelocationHandler extends ElfRelocationHandler {
 	}
 
 	@Override
-	public void relocate(ElfRelocationContext elfRelocationContext, ElfRelocation relocation, Address relocationAddress)
+	public RelocationResult relocate(ElfRelocationContext elfRelocationContext, ElfRelocation relocation, Address relocationAddress)
 			throws MemoryAccessException, NotFoundException {
 
 		ElfHeader elf = elfRelocationContext.getElfHeader();
 		if (!canRelocate(elf)) {
-			return;
+			return RelocationResult.FAILURE;
 		}
 		
 		Program program = elfRelocationContext.getProgram();
@@ -44,6 +46,8 @@ public class Blackfin_ElfRelocationHandler extends ElfRelocationHandler {
 			symbolName = sym.getNameAsString();
 		}
 		
+		int byteLength = 4;
+
 		switch (type) {
 			case Blackfin_ElfRelocationConstants.R_BFIN_FUNCDESC:
 				memory.setInt(relocationAddress, (int)symbolValue);
@@ -52,13 +56,15 @@ public class Blackfin_ElfRelocationHandler extends ElfRelocationHandler {
 			case Blackfin_ElfRelocationConstants.R_BFIN_FUNCDESC_VALUE:
 				memory.setInt(relocationAddress, (int)symbolValue);
 				memory.setInt(relocationAddress.add(4), 0);
+				byteLength = 8;
 				break;
 				
 			default:
 				markAsUnhandled(program, relocationAddress, type, symbolIndex, symbolName, elfRelocationContext.getLog());
-				break;
+				return RelocationResult.UNSUPPORTED;
 		}
 		
+		return new RelocationResult(Status.APPLIED, byteLength);
 		
 	}
 
