@@ -717,7 +717,7 @@ Mv_src: srcreg_1 is srcreg_1 & srcgrp=1 { export srcreg_1; }
 Mv_src: srcreg_2 is srcreg_2 & srcgrp=2 { export srcreg_2; }
 Mv_src: srcreg_3 is srcreg_3 & srcgrp=3 { export srcreg_3; }
 Mv_src: srcreg_4 is srcreg_4 & srcgrp=4 { export srcreg_4; }
-Mv_src: srcreg_5 is srcreg_5 & srcgrp=5 { export srcreg_5; }
+#Mv_src: srcreg_5 is srcreg_5 & srcgrp=5 { export srcreg_5; }
 Mv_src: srcreg_6 is srcreg_6 & srcgrp=6 { export srcreg_6; }
 Mv_src: srcreg_7 is srcreg_7 & srcgrp=7 { export srcreg_7; }
 
@@ -726,7 +726,7 @@ Mv_dest: destreg_1 is destreg_1 & destgrp=1 { export destreg_1; }
 Mv_dest: destreg_2 is destreg_2 & destgrp=2 { export destreg_2; }
 Mv_dest: destreg_3 is destreg_3 & destgrp=3 { export destreg_3; }
 Mv_dest: destreg_4 is destreg_4 & destgrp=4 { export destreg_4; }
-Mv_dest: destreg_5 is destreg_5 & destgrp=5 { export destreg_5; }
+#Mv_dest: destreg_5 is destreg_5 & destgrp=5 { export destreg_5; }
 Mv_dest: destreg_6 is destreg_6 & destgrp=6 { export destreg_6; }
 Mv_dest: destreg_7 is destreg_7 & destgrp=7 { export destreg_7; }
 
