@@ -33,6 +33,13 @@
                 <pentry minsize="5" maxsize="8">
                     <addr space="join" piece1="R0" piece2="R1"/>
                 </pentry>
+                <!-- Soft-float comparators (double_lt/eq/cmp, ...) return their
+                     boolean in CC, not R0. Listed last so R0 stays preferred for
+                     normal returns; the decompiler picks CCflag only when it is
+                     the value live at the function's return. -->
+                <pentry minsize="1" maxsize="1">
+                    <register name="CCflag"/>
+                </pentry>
             </output>
             <unaffected>
                 <register name="R4"/>

@@ -383,6 +383,85 @@ macro ternary(res, cond, avar, bvar) {
 	res = (avar * zext(cond != 0)) + (bvar * zext(cond == 0));
 }
 
+# DSP 16x16 multiply (decode_multfunc in the binutils Blackfin sim).
+# packed holds the two selected 16-bit operands: bits 31:16 = src0 half,
+# bits 15:0 = src1 half. modeid bit7 = MM (mixed), bits 6:0 = mmod mode number
+# (4=fu 6=tfu 12=iu unsigned; 8=is 9=iss2 11=ih 0/1/2/3 signed). val = 32-bit
+# product, <<1 for the fractional modes (0,s2rnd,t,w32) when not mixed.
+macro dsp_mult(val, packed, modeid) {
+    local mm:1   = (modeid >> 7) & 1;
+    local mode:1 = modeid & 0x7f;
+    local s0:4 = (packed >> 16) & 0xffff;
+    local s1:4 = packed & 0xffff;
+    local uns:1 = (mode == 4) | (mode == 6) | (mode == 12);
+    local s0u:1 = (mm == 0) & uns;
+    local s1u:1 = mm | uns;
+    local s0sx:4 = (s0 ^ 0x8000) - 0x8000;
+    local s1sx:4 = (s1 ^ 0x8000) - 0x8000;
+    local s0v:4;
+    local s1v:4;
+    ternary(s0v, s0u, s0, s0sx);
+    ternary(s1v, s1u, s1, s1sx);
+    local prod:4 = s0v * s1v;
+    local dosh:1 = (mm == 0) & ((mode==0)|(mode==1)|(mode==2)|(mode==3));
+    ternary(val, dosh, prod << 1, prod);
+}
+
+# Dual 16-bit (vector) add/sub: high and low halves operated independently.
+# Saturation/cross-options are not modeled.
+macro vec_add(out, a, b)    { local h:4 = ((a >> 16) + (b >> 16)) << 16; local l:4 = (a + b) & 0xffff; out = h | l; }
+macro vec_sub(out, a, b)    { local h:4 = ((a >> 16) - (b >> 16)) << 16; local l:4 = (a - b) & 0xffff; out = h | l; }
+macro vec_addsub(out, a, b) { local h:4 = ((a >> 16) + (b >> 16)) << 16; local l:4 = (a - b) & 0xffff; out = h | l; }
+macro vec_subadd(out, a, b) { local h:4 = ((a >> 16) - (b >> 16)) << 16; local l:4 = (a + b) & 0xffff; out = h | l; }
+
+# Full-register (P=1) multiply result.
+macro dsp_mult_full(outreg, packed, modeid) {
+    local val:4;
+    dsp_mult(val, packed, modeid);
+    outreg = val;
+}
+
+# Reduce a 32-bit product/accumulator to a 16-bit half register per mode.
+macro dsp_extract_half(outhalf, val, modeid) {
+    local mode:1 = modeid & 0x7f;
+    local isint:1 = (mode==8)|(mode==12)|(mode==9);
+    local istr:1  = (mode==6)|(mode==2);
+    local lowh:4 = val & 0xffff;
+    local trh:4  = val >> 16;
+    local rnh:4  = (val + 0x8000) >> 16;
+    local notint:4;
+    local hi:4;
+    ternary(notint, istr, trh, rnh);
+    ternary(hi, isint, lowh, notint);
+    outhalf = hi:2;
+}
+
+# Half-register (P=0) multiply result (extract_mult). Integer modes -> low 16;
+# tfu/t -> truncated high 16; fractional/default -> rounded high 16.
+macro dsp_mult_half(outhalf, packed, modeid) {
+    local val:4;
+    dsp_mult(val, packed, modeid);
+    dsp_extract_half(outhalf, val, modeid);
+}
+
+# Multiply-accumulate into a 40-bit accumulator (modeled in the 8-byte A reg).
+# info packs op in bits 39:32 (0=load, 1=add, 2=sub) and the multiply operands
+# in bits 31:0. 40-bit saturation is not modeled (rare; clutters output).
+macro dsp_mac(acc, info, modeid) {
+    local ih:8 = info >> 32;
+    local op:1 = ih:1;
+    local packed4:8 = info & 0xffffffff;
+    local packed:4 = packed4:4;
+    local prod:4;
+    dsp_mult(prod, packed, modeid);
+    local p40:8 = sext(prod);
+    local added:8 = acc + p40;
+    local subbed:8 = acc - p40;
+    local r1:8;
+    ternary(r1, (op == 2), subbed, added);
+    ternary(acc, (op == 0), p40, r1);
+}
+
 macro push(reg) {
     SP = SP - 4;
     *SP = reg;
@@ -393,16 +472,71 @@ macro pop(reg) {
     SP = SP + 4;
 }
 
+# ---- ASTAT ALU status-flag helpers --------------------------------------
+# D-register ALU ops update ASTAT (AZ/AN and, for add/sub, AC0/V). The stock
+# module never wrote these, so soft-float compare/classify routines that build
+# their boolean via `CC |= az` / `CC &= az` (after a SUB/ADD/shift) decompiled
+# to empty bodies and left phantom in_AZflag / in_AC0flag inputs. These helpers
+# model the writes; the decompiler prunes any flag that is never read, so
+# instrumenting the whole DALU set is free in the output and only surfaces the
+# flags actually consumed.  (P-register arithmetic does NOT touch ASTAT, so it
+# is intentionally left alone.)
+macro setflags_nz(res) {
+    AZflag = (res == 0);
+    ANflag = (res s< 0);
+}
+# Logical ops (AND/OR/XOR/NOT) and move-zero-extend: AZ/AN per result, and per
+# the ISA they CLEAR AC0 and V. (Shifts use setflags_nz instead: they leave AC0
+# unaffected and set V on overflow, which is not modeled.)
+macro setflags_logical(res) {
+    AZflag = (res == 0);
+    ANflag = (res s< 0);
+    AC0flag = 0;
+    Vflag = 0;
+}
+macro setflags_add(res, a, b) {
+    AZflag = (res == 0);
+    ANflag = (res s< 0);
+    AC0flag = carry(a, b);
+    Vflag = scarry(a, b);
+}
+macro setflags_sub(res, a, b) {
+    AZflag = (res == 0);
+    ANflag = (res s< 0);
+    AC0flag = (b <= a);
+    Vflag = sborrow(a, b);
+}
+
 define pcodeop idle;
 define pcodeop csync;
 define pcodeop ssync;
 define pcodeop raise;
 define pcodeop excpt;
+define pcodeop emuexcpt;
+define pcodeop abort_insn;
 
 define pcodeop prefetch;
 define pcodeop flushinv;
 define pcodeop flush;
 define pcodeop iflush;
+
+# DSP ops whose exact bit-level result is not cleanly expressible in p-code;
+# modeled as named operations so the decompiler shows the true intent.
+define pcodeop signbits;
+define pcodeop expadj;
+define pcodeop vit_max;
+define pcodeop bxorshift;
+define pcodeop bxor;
+define pcodeop bitmux;
+define pcodeop byte_align;
+define pcodeop byteunpack;
+define pcodeop bytepack;
+define pcodeop byteop_avg;
+define pcodeop byteop_addsub;
+define pcodeop saa;
+define pcodeop search;
+define pcodeop disalgnexcpt;
+define pcodeop bitreverse_add;
 
 
 # Mark parallel instructions at the 32bit opcode and use delayslot to include the next two instructions.
@@ -475,8 +609,8 @@ with : phase=1 {
 :IDLE       is op16=0x20 { idle(); }
 :CSYNC      is op16=0x23 { csync(); }
 :SSYNC      is op16=0x24 { ssync(); }
-:EMUEXCPT   is op16=0x25 unimpl
-:ABORT      is op16=0x2f unimpl
+:EMUEXCPT   is op16=0x25 { emuexcpt(); }
+:ABORT      is op16=0x2f { abort_insn(); }
 :CLI Dreg0  is op8=0x0 & opc0407=3 & x03=0 & Dreg0
 {
     local tmp:4 = $(IMASK);
@@ -491,11 +625,13 @@ with : phase=1 {
 
 :JUMP (Preg0)        is op8=0 & opc0407=0x5 & x03=0 & Preg0 { goto [Preg0]; }
 :CALL (Preg0)        is op8=0 & opc0407=0x6 & x03=0 & Preg0 { RETS = inst_next; call [Preg0]; }
-:CALL ("PC" + Preg0) is op8=0 & opc0407=0x7 & x03=0 & Preg0 unimpl
-:JUMP ("PC" + Preg0) is op8=0 & opc0407=0x8 & x03=0 & Preg0 unimpl
+# PC-relative indexed: target = PC (this instruction's address) + Preg.
+:CALL ("PC" + Preg0) is op8=0 & opc0407=0x7 & x03=0 & Preg0 { RETS = inst_next; call [inst_start + Preg0]; }
+:JUMP ("PC" + Preg0) is op8=0 & opc0407=0x8 & x03=0 & Preg0 { goto [inst_start + Preg0]; }
 :RAISE uimm4         is op8=0 & opc0407=0x9 & uimm4         { raise(uimm4:1); }
 :EXCPT uimm4         is op8=0 & opc0407=0xa & uimm4         { excpt(uimm4:1); }
-:TESTSET (Preg0)     is op8=0 & opc0407=0xb & x03=0 & Preg0 unimpl
+# Atomic test-and-set: load the byte at [Preg], CC = (byte == 0), set its MSB.
+:TESTSET (Preg0)     is op8=0 & opc0407=0xb & x03=0 & Preg0 { local b:1 = *[ram]:1 Preg0; CCflag = (b == 0); *[ram]:1 Preg0 = b | 0x80; }
 
 
 #####
@@ -673,9 +809,11 @@ CCreg3: Preg3 is g06=1 & Preg3 { export Preg3; }
 :CC = CCreg0 < uimm3 "(IU)"   is op6=0x3 & opc0709=3 & CCreg0 & uimm3  { CCflag = (CCreg0 < uimm3); }
 :CC = CCreg0 <= CCreg3 "(IU)" is op6=0x2 & opc0709=4 & CCreg0 & CCreg3 { CCflag = (CCreg0 <= CCreg3); }
 :CC = CCreg0 <= uimm3 "(IU)"  is op6=0x3 & opc0709=4 & CCreg0 & uimm3  { CCflag = (CCreg0 <= uimm3); }
-:CC = A0 == A1                is op6=0x2 & opc0709=5 & g06=0 & A0 & A1 unimpl
-:CC = A0 < A1                 is op6=0x2 & opc0709=6 & g06=0 & A0 & A1 unimpl
-:CC = A0 <= A1                is op6=0x2 & opc0709=7 & g06=0 & A0 & A1 unimpl
+# 40-bit accumulator compares. Sign-extend bit 39 into the 8-byte container
+# (<<24 then s>>24) so the signed comparisons are correct.
+:CC = A0 == A1                is op6=0x2 & opc0709=5 & g06=0 & A0 & A1 { local a:8 = A0 << 24; a = a s>> 24; local b:8 = A1 << 24; b = b s>> 24; CCflag = (a == b); }
+:CC = A0 < A1                 is op6=0x2 & opc0709=6 & g06=0 & A0 & A1 { local a:8 = A0 << 24; a = a s>> 24; local b:8 = A1 << 24; b = b s>> 24; CCflag = (a s< b); }
+:CC = A0 <= A1                is op6=0x2 & opc0709=7 & g06=0 & A0 & A1 { local a:8 = A0 << 24; a = a s>> 24; local b:8 = A1 << 24; b = b s>> 24; CCflag = (a s<= b); }
 
 
 #####
@@ -741,21 +879,45 @@ Mv_dest: destreg_7 is destreg_7 & destgrp=7 { export destreg_7; }
 # | 0 | 1 | 0 | 0 | 0 | 0 |.opc...........|.src.......|.dest......|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-:ASHIFT Dreg0 >>>= Dreg3 is op6=0x10 & opc0609=0  & Dreg3 & Dreg0 { Dreg0 = Dreg0 s>> Dreg3; }
-:LSHIFT Dreg0 >>= Dreg3  is op6=0x10 & opc0609=1  & Dreg3 & Dreg0 { Dreg0 = Dreg0 >> Dreg3; }
-:LSHIFT Dreg0 <<= Dreg3  is op6=0x10 & opc0609=2  & Dreg3 & Dreg0 { Dreg0 = Dreg0 << Dreg3; }
+:ASHIFT Dreg0 >>>= Dreg3 is op6=0x10 & opc0609=0  & Dreg3 & Dreg0 { local r:4 = Dreg0 s>> Dreg3; setflags_nz(r); Dreg0 = r; }
+:LSHIFT Dreg0 >>= Dreg3  is op6=0x10 & opc0609=1  & Dreg3 & Dreg0 { local r:4 = Dreg0 >> Dreg3; setflags_nz(r); Dreg0 = r; }
+:LSHIFT Dreg0 <<= Dreg3  is op6=0x10 & opc0609=2  & Dreg3 & Dreg0 { local r:4 = Dreg0 << Dreg3; setflags_nz(r); Dreg0 = r; }
 :MULT Dreg0 *= Dreg3     is op6=0x10 & opc0609=3  & Dreg3 & Dreg0 { Dreg0 = Dreg0 * Dreg3; }
 :ADD Dreg0 = (Dreg0_2 + Dreg3) << 1 is op6=0x10 & opc0609=4 & Dreg3 & Dreg0 & Dreg0_2 { Dreg0 = (Dreg0 + Dreg3)*2; }
 :ADD Dreg0 = (Dreg0_2 + Dreg3) << 2 is op6=0x10 & opc0609=5 & Dreg3 & Dreg0 & Dreg0_2 { Dreg0 = (Dreg0 + Dreg3)*4; }
 # opc0609= 6 and 7 not defined
-:DIVQ (Dreg0, Dreg3)        is op6=0x10 & opc0609=8 & Dreg3 & Dreg0 unimpl
-:DIVS (Dreg0, Dreg3)        is op6=0x10 & opc0609=9 & Dreg3 & Dreg0 unimpl
+# Divide primitives (single divide step). Semantics follow the GNU binutils
+# Blackfin simulator (sim/bfin/bfin-sim.c: divq()/divs()). AQflag is ASTAT.AQ.
+:DIVQ (Dreg0, Dreg3)        is op6=0x10 & opc0609=8 & Dreg3 & Dreg0 {
+    local af:4   = (Dreg0 >> 16) & 0xffff;
+    local dvsr:4 = Dreg3 & 0xffff;
+    local r:4;
+    if (AQflag == 0) goto <sub>;
+        r = (dvsr + af) & 0xffff;
+        goto <have_r>;
+    <sub>
+        r = (af - dvsr) & 0xffff;
+    <have_r>
+    local aqf:4 = ((r ^ dvsr) >> 15) & 1;
+    AQflag = aqf:1;
+    local naq:4 = aqf ^ 1;
+    local pq:4 = (Dreg0 << 1) | naq;
+    Dreg0 = (pq & 0x1FFFF) | (r << 17);
+}
+:DIVS (Dreg0, Dreg3)        is op6=0x10 & opc0609=9 & Dreg3 & Dreg0 {
+    local rr:4   = (Dreg0 >> 16) & 0xffff;
+    local dvsr:4 = Dreg3 & 0xffff;
+    local aqf:4  = ((rr ^ dvsr) >> 15) & 1;
+    AQflag = aqf:1;
+    local pq:4 = (Dreg0 << 1) | aqf;
+    Dreg0 = (pq & 0x1FFFF) | (rr << 17);
+}
 :MOVE Dreg0 = Dreg_l3 "(X)" is op6=0x10 & opc0609=10 & Dreg_l3 & Dreg0 { Dreg0 = sext(Dreg_l3); }
 :MOVE Dreg0 = Dreg_l3 "(Z)" is op6=0x10 & opc0609=11 & Dreg_l3 & Dreg0 { Dreg0 = zext(Dreg_l3); }
 :MOVE Dreg0 = Dreg_b3 "(X)" is op6=0x10 & opc0609=12 & Dreg_b3 & Dreg0 { Dreg0 = sext(Dreg_b3); }
 :MOVE Dreg0 = Dreg_b3 "(Z)" is op6=0x10 & opc0609=13 & Dreg_b3 & Dreg0 { Dreg0 = zext(Dreg_b3); }
-:NEG  Dreg0 = -Dreg3        is op6=0x10 & opc0609=14 & Dreg3   & Dreg0 { Dreg0 = -Dreg3; }
-:NOT  Dreg0 = ~Dreg3        is op6=0x10 & opc0609=15 & Dreg3   & Dreg0 { Dreg0 = ~Dreg3; }
+:NEG  Dreg0 = -Dreg3        is op6=0x10 & opc0609=14 & Dreg3   & Dreg0 { local r:4 = -Dreg3; setflags_sub(r, 0:4, Dreg3); Dreg0 = r; }
+:NOT  Dreg0 = ~Dreg3        is op6=0x10 & opc0609=15 & Dreg3   & Dreg0 { local r:4 = ~Dreg3; setflags_logical(r); Dreg0 = r; }
 
 
 #####
@@ -770,7 +932,7 @@ Mv_dest: destreg_7 is destreg_7 & destgrp=7 { export destreg_7; }
 :LSHIFT Preg0 = Preg3 << 1          is op7=0x22 & opc0608=2 & Preg3 & Preg0 { Preg0 = Preg3 << 1; }
 :LSHIFT Preg0 = Preg3 >> 2          is op7=0x22 & opc0608=3 & Preg3 & Preg0 { Preg0 = Preg3 >> 2; }
 :LSHIFT Preg0 = Preg3 >> 1          is op7=0x22 & opc0608=4 & Preg3 & Preg0 { Preg0 = Preg3 >> 1; }
-:ADD Preg0 += Preg3 "(brev)"        is op7=0x22 & opc0608=5 & Preg3 & Preg0 unimpl
+:ADD Preg0 += Preg3 "(brev)"        is op7=0x22 & opc0608=5 & Preg3 & Preg0 { Preg0 = bitreverse_add(Preg0, Preg3); }
 :ADD Preg0 = (Preg0_2 + Preg3) << 1 is op7=0x22 & opc0608=6 & Preg3 & Preg0 & Preg0_2 { Preg0 = (Preg0 + Preg3)*2; }
 :ADD Preg0 = (Preg0_2 + Preg3) << 2 is op7=0x22 & opc0608=7 & Preg3 & Preg0 & Preg0_2 { Preg0 = (Preg0 + Preg3)*4; }
 
@@ -787,9 +949,9 @@ Mv_dest: destreg_7 is destreg_7 & destgrp=7 { export destreg_7; }
 :BITSET (Dreg0, uimm50307)   is op5=0x9 & opc0810=2 & uimm50307 & Dreg0 { Dreg0 = Dreg0 | (1 << uimm50307); }
 :BITTGL (Dreg0, uimm50307)   is op5=0x9 & opc0810=3 & uimm50307 & Dreg0 { Dreg0 = Dreg0 ^ (1 << uimm50307); }
 :BITCLR (Dreg0, uimm50307)   is op5=0x9 & opc0810=4 & uimm50307 & Dreg0 { Dreg0 = Dreg0 & ~(1 << uimm50307); }
-:ASHIFT Dreg0 >>>= uimm50307 is op5=0x9 & opc0810=5 & uimm50307 & Dreg0 { Dreg0 = Dreg0 s>> uimm50307; }
-:LSHIFT Dreg0 >>= uimm50307  is op5=0x9 & opc0810=6 & uimm50307 & Dreg0 { Dreg0 = Dreg0 >> uimm50307; }
-:LSHIFT Dreg0 <<= uimm50307  is op5=0x9 & opc0810=7 & uimm50307 & Dreg0 { Dreg0 = Dreg0 << uimm50307; }
+:ASHIFT Dreg0 >>>= uimm50307 is op5=0x9 & opc0810=5 & uimm50307 & Dreg0 { local r:4 = Dreg0 s>> uimm50307; setflags_nz(r); Dreg0 = r; }
+:LSHIFT Dreg0 >>= uimm50307  is op5=0x9 & opc0810=6 & uimm50307 & Dreg0 { local r:4 = Dreg0 >> uimm50307; setflags_nz(r); Dreg0 = r; }
+:LSHIFT Dreg0 <<= uimm50307  is op5=0x9 & opc0810=7 & uimm50307 & Dreg0 { local r:4 = Dreg0 << uimm50307; setflags_nz(r); Dreg0 = r; }
 
 
 #####
@@ -799,11 +961,11 @@ Mv_dest: destreg_7 is destreg_7 & destgrp=7 { export destreg_7; }
 # | 0 | 1 | 0 | 1 |.opc.......|.dest......|.src1......|.src0......|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-:ADD Dreg6 = Dreg0 + Dreg3 is op4=0x5 & opc0911=0 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 + Dreg3; }
-:SUB Dreg6 = Dreg0 - Dreg3 is op4=0x5 & opc0911=1 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 - Dreg3; }
-:AND Dreg6 = Dreg0 & Dreg3 is op4=0x5 & opc0911=2 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 & Dreg3; }
-:OR  Dreg6 = Dreg0 | Dreg3 is op4=0x5 & opc0911=3 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 | Dreg3; }
-:XOR Dreg6 = Dreg0 "^" Dreg3 is op4=0x5 & opc0911=4 & Dreg6 & Dreg3 & Dreg0 { Dreg6 = Dreg0 ^ Dreg3; }
+:ADD Dreg6 = Dreg0 + Dreg3 is op4=0x5 & opc0911=0 & Dreg6 & Dreg3 & Dreg0 { local r:4 = Dreg0 + Dreg3; setflags_add(r, Dreg0, Dreg3); Dreg6 = r; }
+:SUB Dreg6 = Dreg0 - Dreg3 is op4=0x5 & opc0911=1 & Dreg6 & Dreg3 & Dreg0 { local r:4 = Dreg0 - Dreg3; setflags_sub(r, Dreg0, Dreg3); Dreg6 = r; }
+:AND Dreg6 = Dreg0 & Dreg3 is op4=0x5 & opc0911=2 & Dreg6 & Dreg3 & Dreg0 { local r:4 = Dreg0 & Dreg3; setflags_logical(r); Dreg6 = r; }
+:OR  Dreg6 = Dreg0 | Dreg3 is op4=0x5 & opc0911=3 & Dreg6 & Dreg3 & Dreg0 { local r:4 = Dreg0 | Dreg3; setflags_logical(r); Dreg6 = r; }
+:XOR Dreg6 = Dreg0 "^" Dreg3 is op4=0x5 & opc0911=4 & Dreg6 & Dreg3 & Dreg0 { local r:4 = Dreg0 ^ Dreg3; setflags_logical(r); Dreg6 = r; }
 :ADD Preg6 = Preg0 + Preg3 is op4=0x5 & opc0911=5 & Preg6 & Preg3 & Preg0 { Preg6 = Preg0 + Preg3; }
 :ADD Preg6 = Preg0 + (Preg3 << 1) is op4=0x5 & opc0911=6 & Preg6 & Preg3 & Preg0 { Preg6 = Preg0 + Preg3*2; }
 :ADD Preg6 = Preg0 + (Preg3 << 2) is op4=0x5 & opc0911=7 & Preg6 & Preg3 & Preg0 { Preg6 = Preg0 + Preg3*4; }
@@ -820,7 +982,8 @@ LdImmReg: Dreg0 is g11=0 & Dreg0 { export Dreg0; }
 LdImmReg: Preg0 is g11=1 & Preg0 { export Preg0; }
 
 :LOAD LdImmReg = imm7    is op4=6 & opc10=0 & imm7 & LdImmReg { LdImmReg = imm7; }
-:ADD LdImmReg += imm7    is op4=6 & opc10=1 & imm7 & LdImmReg { LdImmReg = LdImmReg + imm7; }
+:ADD Dreg0 += imm7    is op4=6 & opc10=1 & g11=0 & imm7 & Dreg0 { local r:4 = Dreg0 + imm7; setflags_nz(r); Dreg0 = r; }
+:ADD Preg0 += imm7    is op4=6 & opc10=1 & g11=1 & imm7 & Preg0 { Preg0 = Preg0 + imm7; }
 #:SUB LdImmReg += imm7 (-= imm) is op4=6 & opc10=1 & s09=1 & imm7 & LdImmReg [imm = -imm7;] { LdImmReg = LdImmReg - imm; }
 
 
@@ -907,7 +1070,7 @@ LdI_ptr2: [Ireg3]   is aop0708=2 & Ireg3 { export Ireg3; }
 # ToDo: circular buffer handling
 
 :ADD Ireg0 += Mreg2          is op8=0x9e & b07=0 & op0406=6 & Mreg2 & Ireg0 { Ireg0 = Ireg0 + Mreg2; }
-:ADD Ireg0 += Mreg2 "(brev)" is op8=0x9e & b07=1 & op0406=6 & Mreg2 & Ireg0 unimpl
+:ADD Ireg0 += Mreg2 "(brev)" is op8=0x9e & b07=1 & op0406=6 & Mreg2 & Ireg0 { Ireg0 = bitreverse_add(Ireg0, Mreg2); }
 :SUB Ireg0 -= Mreg2          is op8=0x9e & b07=0 & op0406=7 & Mreg2 & Ireg0 { Ireg0 = Ireg0 - Mreg2; }
 
 
@@ -975,123 +1138,125 @@ LdStIFP_ptr: [FP + offset] is FP & LdStIFP_off [offset = -((~LdStIFP_off & 0x1f)
 # |h01|h11|.w0|.op0...|h00|h10|.dest......|.src0......|.src1......|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-MAC0S: xreg3_l * xreg0_l is xh00=0 & xh10=0 & xreg3_l & xreg0_l unimpl
-MAC0S: xreg3_l * xreg0_h is xh00=0 & xh10=1 & xreg3_l & xreg0_h unimpl
-MAC0S: xreg3_h * xreg0_l is xh00=1 & xh10=0 & xreg3_h & xreg0_l unimpl
-MAC0S: xreg3_h * xreg0_h is xh00=1 & xh10=1 & xreg3_h & xreg0_h unimpl
+# MACnS export packed multiply operands (src0 half << 16 | src1 half).
+MAC0S: xreg3_l * xreg0_l is xh00=0 & xh10=0 & xreg3_l & xreg0_l { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_l); export t; }
+MAC0S: xreg3_l * xreg0_h is xh00=0 & xh10=1 & xreg3_l & xreg0_h { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_h); export t; }
+MAC0S: xreg3_h * xreg0_l is xh00=1 & xh10=0 & xreg3_h & xreg0_l { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_l); export t; }
+MAC0S: xreg3_h * xreg0_h is xh00=1 & xh10=1 & xreg3_h & xreg0_h { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_h); export t; }
 
-MAC0: A0 =  MAC0S is A0 & MAC0S & xop01112=0 unimpl
-MAC0: A0 += MAC0S is A0 & MAC0S & xop01112=1 unimpl
-MAC0: A0 -= MAC0S is A0 & MAC0S & xop01112=2 unimpl
+# MACn export the accumulate op (bits 39:32: 0=load 1=add 2=sub) | operands.
+MAC0: A0 =  MAC0S is A0 & MAC0S & xop01112=0 { local v:8 = zext(MAC0S);                export v; }
+MAC0: A0 += MAC0S is A0 & MAC0S & xop01112=1 { local v:8 = (1:8 << 32) | zext(MAC0S);  export v; }
+MAC0: A0 -= MAC0S is A0 & MAC0S & xop01112=2 { local v:8 = (2:8 << 32) | zext(MAC0S);  export v; }
 
-MAC1S: xreg3_l * xreg0_l is xh01=0 & xh11=0 & xreg3_l & xreg0_l unimpl
-MAC1S: xreg3_l * xreg0_h is xh01=0 & xh11=1 & xreg3_l & xreg0_h unimpl
-MAC1S: xreg3_h * xreg0_l is xh01=1 & xh11=0 & xreg3_h & xreg0_l unimpl
-MAC1S: xreg3_h * xreg0_h is xh01=1 & xh11=1 & xreg3_h & xreg0_h unimpl
+MAC1S: xreg3_l * xreg0_l is xh01=0 & xh11=0 & xreg3_l & xreg0_l { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_l); export t; }
+MAC1S: xreg3_l * xreg0_h is xh01=0 & xh11=1 & xreg3_l & xreg0_h { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_h); export t; }
+MAC1S: xreg3_h * xreg0_l is xh01=1 & xh11=0 & xreg3_h & xreg0_l { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_l); export t; }
+MAC1S: xreg3_h * xreg0_h is xh01=1 & xh11=1 & xreg3_h & xreg0_h { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_h); export t; }
 
-MAC1: A1 =  MAC1S is A1 & op10001=0 ; MAC1S unimpl
-MAC1: A1 += MAC1S is A1 & op10001=1 ; MAC1S unimpl
-MAC1: A1 -= MAC1S is A1 & op10001=2 ; MAC1S unimpl
+MAC1: A1 =  MAC1S is A1 & op10001=0 ; MAC1S { local v:8 = zext(MAC1S);               export v; }
+MAC1: A1 += MAC1S is A1 & op10001=1 ; MAC1S { local v:8 = (1:8 << 32) | zext(MAC1S); export v; }
+MAC1: A1 -= MAC1S is A1 & op10001=2 ; MAC1S { local v:8 = (2:8 << 32) | zext(MAC1S); export v; }
 
-MMOD0:         is mmod0508=0 unimpl
-MMOD0: "(w32)" is mmod0508=3 unimpl
-MMOD0: "(fu)"  is mmod0508=4 unimpl
-MMOD0: "(is)"  is mmod0508=8 unimpl
+MMOD0:         is mmod0508=0 { local m:1 = 0; export m; }
+MMOD0: "(w32)" is mmod0508=3 { local m:1 = 3; export m; }
+MMOD0: "(fu)"  is mmod0508=4 { local m:1 = 4; export m; }
+MMOD0: "(is)"  is mmod0508=8 { local m:1 = 8; export m; }
 
-MMOD1:           is mmod0508=0 unimpl
-MMOD1: "(s2rnd)" is mmod0508=1 unimpl
-MMOD1: "(t)"     is mmod0508=2 unimpl
-MMOD1: "(fu)"    is mmod0508=4 unimpl
-MMOD1: "(tfu)"   is mmod0508=6 unimpl
-MMOD1: "(is)"    is mmod0508=8 unimpl
-MMOD1: "(iss2)"  is mmod0508=9 unimpl
-MMOD1: "(ih)"    is mmod0508=11 unimpl
-MMOD1: "(iu)"    is mmod0508=12 unimpl
+MMOD1:           is mmod0508=0 { local m:1 = 0; export m; }
+MMOD1: "(s2rnd)" is mmod0508=1 { local m:1 = 1; export m; }
+MMOD1: "(t)"     is mmod0508=2 { local m:1 = 2; export m; }
+MMOD1: "(fu)"    is mmod0508=4 { local m:1 = 4; export m; }
+MMOD1: "(tfu)"   is mmod0508=6 { local m:1 = 6; export m; }
+MMOD1: "(is)"    is mmod0508=8 { local m:1 = 8; export m; }
+MMOD1: "(iss2)"  is mmod0508=9 { local m:1 = 9; export m; }
+MMOD1: "(ih)"    is mmod0508=11 { local m:1 = 11; export m; }
+MMOD1: "(iu)"    is mmod0508=12 { local m:1 = 12; export m; }
 
-MMODE:           is mmod0508=0 unimpl
-MMODE: "(s2rnd)" is mmod0508=1 unimpl
-MMODE: "(fu)"    is mmod0508=4 unimpl
-MMODE: "(is)"    is mmod0508=8 unimpl
-MMODE: "(iss2)"  is mmod0508=9 unimpl
-MMODE: "(iu)"    is mmod0508=12 unimpl
+MMODE:           is mmod0508=0 { local m:1 = 0; export m; }
+MMODE: "(s2rnd)" is mmod0508=1 { local m:1 = 1; export m; }
+MMODE: "(fu)"    is mmod0508=4 { local m:1 = 4; export m; }
+MMODE: "(is)"    is mmod0508=8 { local m:1 = 8; export m; }
+MMODE: "(iss2)"  is mmod0508=9 { local m:1 = 9; export m; }
+MMODE: "(iu)"    is mmod0508=12 { local m:1 = 12; export m; }
 
-MML:       is mm04=0 unimpl
-MML: "(m)" is mm04=1 unimpl
+MML:       is mm04=0 { local m:1 = 0; export m; }
+MML: "(m)" is mm04=1 { local m:1 = 1; export m; }
 
-MMLMMOD0:           is mm04=0 & mmod0508=0 unimpl
-MMLMMOD0: "(w32)"   is mm04=0 & mmod0508=3 unimpl
-MMLMMOD0: "(fu)"    is mm04=0 & mmod0508=4 unimpl
-MMLMMOD0: "(is)"    is mm04=0 & mmod0508=8 unimpl
-MMLMMOD0: "(m)"     is mm04=1 & mmod0508=0 unimpl
-MMLMMOD0: "(m,w32)" is mm04=1 & mmod0508=3 unimpl
-MMLMMOD0: "(m,fu)"  is mm04=1 & mmod0508=4 unimpl
-MMLMMOD0: "(m,is)"  is mm04=1 & mmod0508=8 unimpl
+MMLMMOD0:           is mm04=0 & mmod0508=0 { local m:1 = 0; export m; }
+MMLMMOD0: "(w32)"   is mm04=0 & mmod0508=3 { local m:1 = 3; export m; }
+MMLMMOD0: "(fu)"    is mm04=0 & mmod0508=4 { local m:1 = 4; export m; }
+MMLMMOD0: "(is)"    is mm04=0 & mmod0508=8 { local m:1 = 8; export m; }
+MMLMMOD0: "(m)"     is mm04=1 & mmod0508=0 { local m:1 = 128; export m; }
+MMLMMOD0: "(m,w32)" is mm04=1 & mmod0508=3 { local m:1 = 131; export m; }
+MMLMMOD0: "(m,fu)"  is mm04=1 & mmod0508=4 { local m:1 = 132; export m; }
+MMLMMOD0: "(m,is)"  is mm04=1 & mmod0508=8 { local m:1 = 136; export m; }
 
-MMLMMOD1:           is mm04=0 & mmod0508=0 unimpl
-MMLMMOD1: "(s2rnd)" is mm04=0 & mmod0508=1 unimpl
-MMLMMOD1: "(t)"     is mm04=0 & mmod0508=2 unimpl
-MMLMMOD1: "(fu)"    is mm04=0 & mmod0508=4 unimpl
-MMLMMOD1: "(tfu)"   is mm04=0 & mmod0508=6 unimpl
-MMLMMOD1: "(is)"    is mm04=0 & mmod0508=8 unimpl
-MMLMMOD1: "(iss2)"  is mm04=0 & mmod0508=9 unimpl
-MMLMMOD1: "(ih)"    is mm04=0 & mmod0508=11 unimpl
-MMLMMOD1: "(iu)"    is mm04=0 & mmod0508=12 unimpl
-MMLMMOD1: "(m)"       is mm04=1 & mmod0508=0 unimpl
-MMLMMOD1: "(m,s2rnd)" is mm04=1 & mmod0508=1 unimpl
-MMLMMOD1: "(m,t)"     is mm04=1 & mmod0508=2 unimpl
-MMLMMOD1: "(m,fu)"    is mm04=1 & mmod0508=4 unimpl
-MMLMMOD1: "(m,tfu)"   is mm04=1 & mmod0508=6 unimpl
-MMLMMOD1: "(m,is)"    is mm04=1 & mmod0508=8 unimpl
-MMLMMOD1: "(m,iss2)"  is mm04=1 & mmod0508=9 unimpl
-MMLMMOD1: "(m,ih)"    is mm04=1 & mmod0508=11 unimpl
-MMLMMOD1: "(m,iu)"    is mm04=1 & mmod0508=12 unimpl
+MMLMMOD1:           is mm04=0 & mmod0508=0 { local m:1 = 0; export m; }
+MMLMMOD1: "(s2rnd)" is mm04=0 & mmod0508=1 { local m:1 = 1; export m; }
+MMLMMOD1: "(t)"     is mm04=0 & mmod0508=2 { local m:1 = 2; export m; }
+MMLMMOD1: "(fu)"    is mm04=0 & mmod0508=4 { local m:1 = 4; export m; }
+MMLMMOD1: "(tfu)"   is mm04=0 & mmod0508=6 { local m:1 = 6; export m; }
+MMLMMOD1: "(is)"    is mm04=0 & mmod0508=8 { local m:1 = 8; export m; }
+MMLMMOD1: "(iss2)"  is mm04=0 & mmod0508=9 { local m:1 = 9; export m; }
+MMLMMOD1: "(ih)"    is mm04=0 & mmod0508=11 { local m:1 = 11; export m; }
+MMLMMOD1: "(iu)"    is mm04=0 & mmod0508=12 { local m:1 = 12; export m; }
+MMLMMOD1: "(m)"       is mm04=1 & mmod0508=0 { local m:1 = 128; export m; }
+MMLMMOD1: "(m,s2rnd)" is mm04=1 & mmod0508=1 { local m:1 = 129; export m; }
+MMLMMOD1: "(m,t)"     is mm04=1 & mmod0508=2 { local m:1 = 130; export m; }
+MMLMMOD1: "(m,fu)"    is mm04=1 & mmod0508=4 { local m:1 = 132; export m; }
+MMLMMOD1: "(m,tfu)"   is mm04=1 & mmod0508=6 { local m:1 = 134; export m; }
+MMLMMOD1: "(m,is)"    is mm04=1 & mmod0508=8 { local m:1 = 136; export m; }
+MMLMMOD1: "(m,iss2)"  is mm04=1 & mmod0508=9 { local m:1 = 137; export m; }
+MMLMMOD1: "(m,ih)"    is mm04=1 & mmod0508=11 { local m:1 = 139; export m; }
+MMLMMOD1: "(m,iu)"    is mm04=1 & mmod0508=12 { local m:1 = 140; export m; }
 
-MMLMMODE:             is mm04=0 & mmod0508=0 unimpl
-MMLMMODE: "(s2rnd)"   is mm04=0 & mmod0508=1 unimpl
-MMLMMODE: "(fu)"      is mm04=0 & mmod0508=4 unimpl
-MMLMMODE: "(is)"      is mm04=0 & mmod0508=8 unimpl
-MMLMMODE: "(iss2)"    is mm04=0 & mmod0508=9 unimpl
-MMLMMODE: "(iu)"      is mm04=0 & mmod0508=12 unimpl
-MMLMMODE: "(m)"       is mm04=1 & mmod0508=0 unimpl
-MMLMMODE: "(m,s2rnd)" is mm04=1 & mmod0508=1 unimpl
-MMLMMODE: "(m,fu)"    is mm04=1 & mmod0508=4 unimpl
-MMLMMODE: "(m,is)"    is mm04=1 & mmod0508=8 unimpl
-MMLMMODE: "(m,iss2)"  is mm04=1 & mmod0508=9 unimpl
-MMLMMODE: "(m,iu)"    is mm04=1 & mmod0508=12 unimpl
+MMLMMODE:             is mm04=0 & mmod0508=0 { local m:1 = 0; export m; }
+MMLMMODE: "(s2rnd)"   is mm04=0 & mmod0508=1 { local m:1 = 1; export m; }
+MMLMMODE: "(fu)"      is mm04=0 & mmod0508=4 { local m:1 = 4; export m; }
+MMLMMODE: "(is)"      is mm04=0 & mmod0508=8 { local m:1 = 8; export m; }
+MMLMMODE: "(iss2)"    is mm04=0 & mmod0508=9 { local m:1 = 9; export m; }
+MMLMMODE: "(iu)"      is mm04=0 & mmod0508=12 { local m:1 = 12; export m; }
+MMLMMODE: "(m)"       is mm04=1 & mmod0508=0 { local m:1 = 128; export m; }
+MMLMMODE: "(m,s2rnd)" is mm04=1 & mmod0508=1 { local m:1 = 129; export m; }
+MMLMMODE: "(m,fu)"    is mm04=1 & mmod0508=4 { local m:1 = 132; export m; }
+MMLMMODE: "(m,is)"    is mm04=1 & mmod0508=8 { local m:1 = 136; export m; }
+MMLMMODE: "(m,iss2)"  is mm04=1 & mmod0508=9 { local m:1 = 137; export m; }
+MMLMMODE: "(m,iu)"    is mm04=1 & mmod0508=12 { local m:1 = 140; export m; }
 
-:MAC^p MAC0 MMOD0             is  p & op0910=0 & op10001=3 & w102=0 & p03=0 & MMOD0       ; xw0=0 & MAC0 unimpl
-:MAC^p MAC1 MMLMMOD0          is (p & op0910=0 &             w102=0 & p03=0 & MMLMMOD0    ; xw0=0 & xop01112=3) & MAC1 unimpl
-:MAC^p MAC1 MML, MAC0 MMOD0   is (p & op0910=0 &             w102=0 & p03=0 & MML & MMOD0 ; xw0=0 & MAC0)       & MAC1 unimpl
+:MAC^p MAC0 MMOD0             is  p & op0910=0 & op10001=3 & w102=0 & p03=0 & MMOD0       ; xw0=0 & MAC0 { dsp_mac(A0, MAC0, MMOD0); build p;}
+:MAC^p MAC1 MMLMMOD0          is (p & op0910=0 &             w102=0 & p03=0 & MMLMMOD0    ; xw0=0 & xop01112=3) & MAC1 { dsp_mac(A1, MAC1, MMLMMOD0); build p;}
+:MAC^p MAC1 MML, MAC0 MMOD0   is (p & op0910=0 &             w102=0 & p03=0 & MML & MMOD0 ; xw0=0 & MAC0)       & MAC1 { local a1m:1 = (MML << 7) | MMOD0; dsp_mac(A0, MAC0, MMOD0); dsp_mac(A1, MAC1, a1m); build p;}
 
-:MAC^p xreg6_l = A0 MMOD1     is  p & op0910=0 & op10001=3 & w102=0 & p03=0 & MMOD1       ; xw0=1 & xop01112=3  & xreg6_l & A0 unimpl
-:MAC^p xreg6_l = (MAC0) MMOD1 is  p & op0910=0 & op10001=3 & w102=0 & p03=0 & MMOD1       ; xw0=1 & MAC0        & xreg6_l unimpl
-:MAC^p MAC1 MML, xreg6_l = A0 MMOD1     is (p & op0910=0 & w102=0 & p03=0 & MML & MMOD1 ; xw0=1 & xop01112=3 & xreg6_l & A0) & MAC1 unimpl
-:MAC^p MAC1 MML, xreg6_l = (MAC0) MMOD1 is (p & op0910=0 & w102=0 & p03=0 & MML & MMOD1 ; xw0=1 & MAC0 & xreg6_l) & MAC1 unimpl
+:MAC^p xreg6_l = A0 MMOD1     is  p & op0910=0 & op10001=3 & w102=0 & p03=0 & MMOD1       ; xw0=1 & xop01112=3  & xreg6_l & A0 { dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
+:MAC^p xreg6_l = (MAC0) MMOD1 is  p & op0910=0 & op10001=3 & w102=0 & p03=0 & MMOD1       ; xw0=1 & MAC0        & xreg6_l { dsp_mac(A0, MAC0, MMOD1); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
+:MAC^p MAC1 MML, xreg6_l = A0 MMOD1     is (p & op0910=0 & w102=0 & p03=0 & MML & MMOD1 ; xw0=1 & xop01112=3 & xreg6_l & A0) & MAC1 { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A1, MAC1, a1m); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
+:MAC^p MAC1 MML, xreg6_l = (MAC0) MMOD1 is (p & op0910=0 & w102=0 & p03=0 & MML & MMOD1 ; xw0=1 & MAC0 & xreg6_l) & MAC1 { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A0, MAC0, MMOD1); dsp_mac(A1, MAC1, a1m); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
 
-:MAC^p xreg6_h = A1 MMLMMOD1      is  p & op0910=0 & op10001=3 & w102=1 & p03=0 & MMLMMOD1 ; xw0=0 & xop01112=3 & xreg6_h & A1 unimpl
-:MAC^p xreg6_h = (MAC1) MMLMMOD1  is (p & op0910=0 & w102=1 & p03=0 & MMLMMOD1 ; xw0=0 & xop01112=3 & xreg6_h) & MAC1 unimpl
-:MAC^p xreg6_h = A1 MML, MAC0 MMOD1     is  p & op0910=0 & op10001=3 & w102=1 & p03=0 & MML & MMOD1 ; xw0=0 & MAC0 & xreg6_h & A1 unimpl
-:MAC^p xreg6_h = (MAC1) MML, MAC0 MMOD1 is (p & op0910=0 & w102=1 & p03=0 & MML & MMOD1 ; xw0=0 & MAC0 & xreg6_h) & MAC1 unimpl
+:MAC^p xreg6_h = A1 MMLMMOD1      is  p & op0910=0 & op10001=3 & w102=1 & p03=0 & MMLMMOD1 ; xw0=0 & xop01112=3 & xreg6_h & A1 { dsp_extract_half(xreg6_h, A1:4, MMLMMOD1); build p;}
+:MAC^p xreg6_h = (MAC1) MMLMMOD1  is (p & op0910=0 & w102=1 & p03=0 & MMLMMOD1 ; xw0=0 & xop01112=3 & xreg6_h) & MAC1 { dsp_mac(A1, MAC1, MMLMMOD1); dsp_extract_half(xreg6_h, A1:4, MMLMMOD1); build p;}
+:MAC^p xreg6_h = A1 MML, MAC0 MMOD1     is  p & op0910=0 & op10001=3 & w102=1 & p03=0 & MML & MMOD1 ; xw0=0 & MAC0 & xreg6_h & A1 { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A0, MAC0, MMOD1); dsp_extract_half(xreg6_h, A1:4, a1m); build p;}
+:MAC^p xreg6_h = (MAC1) MML, MAC0 MMOD1 is (p & op0910=0 & w102=1 & p03=0 & MML & MMOD1 ; xw0=0 & MAC0 & xreg6_h) & MAC1 { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A0, MAC0, MMOD1); dsp_mac(A1, MAC1, a1m); dsp_extract_half(xreg6_h, A1:4, a1m); build p;}
 
-:MAC^p xreg6_h = A1 MML, xreg6_l = A0 MMOD1         is p & op0910=0 & op10001=3 & w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & xop01112=3 & xreg6_l & xreg6_h & A0 & A1    unimpl
-:MAC^p xreg6_h = (MAC1) MML, xreg6_l = A0 MMOD1     is (p & op0910=0 &            w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & xop01112=3 & xreg6_l & xreg6_h & A0) & MAC1 unimpl
-:MAC^p xreg6_h = A1 MML, xreg6_l = (MAC0) MMOD1     is p & op0910=0 & op10001=3 & w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & MAC0       & xreg6_l & xreg6_h & A1         unimpl
-:MAC^p xreg6_h = (MAC1) MML, xreg6_l = (MAC0) MMOD1 is (p & op0910=0 &            w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & MAC0       & xreg6_l & xreg6_h) & MAC1      unimpl
+:MAC^p xreg6_h = A1 MML, xreg6_l = A0 MMOD1         is p & op0910=0 & op10001=3 & w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & xop01112=3 & xreg6_l & xreg6_h & A0 & A1    { local a1m:1 = (MML << 7) | MMOD1; dsp_extract_half(xreg6_h, A1:4, a1m); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
+:MAC^p xreg6_h = (MAC1) MML, xreg6_l = A0 MMOD1     is (p & op0910=0 &            w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & xop01112=3 & xreg6_l & xreg6_h & A0) & MAC1 { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A1, MAC1, a1m); dsp_extract_half(xreg6_h, A1:4, a1m); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
+:MAC^p xreg6_h = A1 MML, xreg6_l = (MAC0) MMOD1     is p & op0910=0 & op10001=3 & w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & MAC0       & xreg6_l & xreg6_h & A1         { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A0, MAC0, MMOD1); dsp_extract_half(xreg6_h, A1:4, a1m); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
+:MAC^p xreg6_h = (MAC1) MML, xreg6_l = (MAC0) MMOD1 is (p & op0910=0 &            w102=1 & p03=0 & MML & MMOD1 ; xw0=1 & MAC0       & xreg6_l & xreg6_h) & MAC1      { local a1m:1 = (MML << 7) | MMOD1; dsp_mac(A0, MAC0, MMOD1); dsp_mac(A1, MAC1, a1m); dsp_extract_half(xreg6_h, A1:4, a1m); dsp_extract_half(xreg6_l, A0:4, MMOD1); build p;}
 
-:MAC^p xreg6_e = A0 MMODE     is p & op0910=0 & op10001=3 & w102=0 & p03=1 & MMODE ; xw0=1 & xop01112=3 & xreg6_e & A0 unimpl
-:MAC^p xreg6_e = (MAC0) MMODE is p & op0910=0 & op10001=3 & w102=0 & p03=1 & MMODE ; xw0=1 & MAC0       & xreg6_e      unimpl
-:MAC^p MAC1 MML, xreg6_e = A0 MMODE     is (p & op0910=0 & w102=0 & p03=1 & MML & MMODE ; xw0=1 & xop01112=3 & xreg6_e & A0) & MAC1 unimpl
-:MAC^p MAC1 MML, xreg6_e = (MAC0) MMODE is (p & op0910=0 & w102=0 & p03=1 & MML & MMODE ; xw0=1 & MAC0       & xreg6_e) & MAC1      unimpl
+:MAC^p xreg6_e = A0 MMODE     is p & op0910=0 & op10001=3 & w102=0 & p03=1 & MMODE ; xw0=1 & xop01112=3 & xreg6_e & A0 { xreg6_e = A0:4; build p;}
+:MAC^p xreg6_e = (MAC0) MMODE is p & op0910=0 & op10001=3 & w102=0 & p03=1 & MMODE ; xw0=1 & MAC0       & xreg6_e      { dsp_mac(A0, MAC0, MMODE); xreg6_e = A0:4; build p;}
+:MAC^p MAC1 MML, xreg6_e = A0 MMODE     is (p & op0910=0 & w102=0 & p03=1 & MML & MMODE ; xw0=1 & xop01112=3 & xreg6_e & A0) & MAC1 { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A1, MAC1, a1m); xreg6_e = A0:4; build p;}
+:MAC^p MAC1 MML, xreg6_e = (MAC0) MMODE is (p & op0910=0 & w102=0 & p03=1 & MML & MMODE ; xw0=1 & MAC0       & xreg6_e) & MAC1      { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A0, MAC0, MMODE); dsp_mac(A1, MAC1, a1m); xreg6_e = A0:4; build p;}
 
-:MAC^p xreg6_o = A1 MMLMMODE     is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MMLMMODE ; xw0=0 & xop01112=3 & xreg6_o & A1      unimpl
-:MAC^p xreg6_o = (MAC1) MMLMMODE is (p & op0910=0 &             w102=1 & p03=1 & MMLMMODE ; xw0=0 & xop01112=3 & xreg6_o) & MAC1   unimpl
-:MAC^p xreg6_o = A1 MML, MAC0 MMODE     is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MML & MMODE ; xw0=0 & MAC0 & xreg6_o & A1      unimpl
-:MAC^p xreg6_o = (MAC1) MML, MAC0 MMODE is (p & op0910=0 &             w102=1 & p03=1 & MML & MMODE ; xw0=0 & MAC0 & xreg6_o) & MAC1   unimpl
+:MAC^p xreg6_o = A1 MMLMMODE     is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MMLMMODE ; xw0=0 & xop01112=3 & xreg6_o & A1      { xreg6_o = A1:4; build p;}
+:MAC^p xreg6_o = (MAC1) MMLMMODE is (p & op0910=0 &             w102=1 & p03=1 & MMLMMODE ; xw0=0 & xop01112=3 & xreg6_o) & MAC1   { dsp_mac(A1, MAC1, MMLMMODE); xreg6_o = A1:4; build p;}
+:MAC^p xreg6_o = A1 MML, MAC0 MMODE     is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MML & MMODE ; xw0=0 & MAC0 & xreg6_o & A1      { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A0, MAC0, MMODE); xreg6_o = A1:4; build p;}
+:MAC^p xreg6_o = (MAC1) MML, MAC0 MMODE is (p & op0910=0 &             w102=1 & p03=1 & MML & MMODE ; xw0=0 & MAC0 & xreg6_o) & MAC1   { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A0, MAC0, MMODE); dsp_mac(A1, MAC1, a1m); xreg6_o = A1:4; build p;}
 
-:MAC^p xreg6_o = A1 MML, xreg6_e = A0 MMODE         is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MML & MMODE ; xw0=1 & xop01112=3 & xreg6_o & xreg6_e & A0 & A1    unimpl
-:MAC^p xreg6_o = A1 MML, xreg6_e = (MAC0) MMODE     is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MML & MMODE ; xw0=1 & MAC0       & xreg6_o & xreg6_e & A1         unimpl
-:MAC^p xreg6_o = (MAC1) MML, xreg6_e = A0 MMODE     is (p & op0910=0 &             w102=1 & p03=1 & MML & MMODE ; xw0=1 & xop01112=3 & xreg6_o & xreg6_e & A0) & MAC1 unimpl
-:MAC^p xreg6_o = (MAC1) MML, xreg6_e = (MAC0) MMODE is (p & op0910=0 &             w102=1 & p03=1 & MML & MMODE ; xw0=1 & MAC0       & xreg6_o & xreg6_e) & MAC1      unimpl
+:MAC^p xreg6_o = A1 MML, xreg6_e = A0 MMODE         is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MML & MMODE ; xw0=1 & xop01112=3 & xreg6_o & xreg6_e & A0 & A1    { local a1m:1 = (MML << 7) | MMODE; xreg6_o = A1:4; xreg6_e = A0:4; build p;}
+:MAC^p xreg6_o = A1 MML, xreg6_e = (MAC0) MMODE     is  p & op0910=0 & op10001=3 & w102=1 & p03=1 & MML & MMODE ; xw0=1 & MAC0       & xreg6_o & xreg6_e & A1         { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A0, MAC0, MMODE); xreg6_o = A1:4; xreg6_e = A0:4; build p;}
+:MAC^p xreg6_o = (MAC1) MML, xreg6_e = A0 MMODE     is (p & op0910=0 &             w102=1 & p03=1 & MML & MMODE ; xw0=1 & xop01112=3 & xreg6_o & xreg6_e & A0) & MAC1 { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A1, MAC1, a1m); xreg6_o = A1:4; xreg6_e = A0:4; build p;}
+:MAC^p xreg6_o = (MAC1) MML, xreg6_e = (MAC0) MMODE is (p & op0910=0 &             w102=1 & p03=1 & MML & MMODE ; xw0=1 & MAC0       & xreg6_o & xreg6_e) & MAC1      { local a1m:1 = (MML << 7) | MMODE; dsp_mac(A0, MAC0, MMODE); dsp_mac(A1, MAC1, a1m); xreg6_o = A1:4; xreg6_e = A0:4; build p;}
 
 
 #####
@@ -1102,23 +1267,24 @@ MMLMMODE: "(m,iu)"    is mm04=1 & mmod0508=12 unimpl
 # |h01|h11|.w0|.op0...|h00|h10|.dest......|.src0......|.src1......|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-MUL0: xreg3_l * xreg0_l is xh00=0 & xh10=0 & xreg3_l & xreg0_l unimpl
-MUL0: xreg3_l * xreg0_h is xh00=0 & xh10=1 & xreg3_l & xreg0_h unimpl
-MUL0: xreg3_h * xreg0_l is xh00=1 & xh10=0 & xreg3_h & xreg0_l unimpl
-MUL0: xreg3_h * xreg0_h is xh00=1 & xh10=1 & xreg3_h & xreg0_h unimpl
+# Export packed operands: bits 31:16 = src0 half, bits 15:0 = src1 half.
+MUL0: xreg3_l * xreg0_l is xh00=0 & xh10=0 & xreg3_l & xreg0_l { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_l); export t; }
+MUL0: xreg3_l * xreg0_h is xh00=0 & xh10=1 & xreg3_l & xreg0_h { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_h); export t; }
+MUL0: xreg3_h * xreg0_l is xh00=1 & xh10=0 & xreg3_h & xreg0_l { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_l); export t; }
+MUL0: xreg3_h * xreg0_h is xh00=1 & xh10=1 & xreg3_h & xreg0_h { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_h); export t; }
 
-MUL1: xreg3_l * xreg0_l is xh01=0 & xh11=0 & xreg3_l & xreg0_l unimpl
-MUL1: xreg3_l * xreg0_h is xh01=0 & xh11=1 & xreg3_l & xreg0_h unimpl
-MUL1: xreg3_h * xreg0_l is xh01=1 & xh11=0 & xreg3_h & xreg0_l unimpl
-MUL1: xreg3_h * xreg0_h is xh01=1 & xh11=1 & xreg3_h & xreg0_h unimpl
+MUL1: xreg3_l * xreg0_l is xh01=0 & xh11=0 & xreg3_l & xreg0_l { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_l); export t; }
+MUL1: xreg3_l * xreg0_h is xh01=0 & xh11=1 & xreg3_l & xreg0_h { local t:4 = (zext(xreg3_l) << 16) | zext(xreg0_h); export t; }
+MUL1: xreg3_h * xreg0_l is xh01=1 & xh11=0 & xreg3_h & xreg0_l { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_l); export t; }
+MUL1: xreg3_h * xreg0_h is xh01=1 & xh11=1 & xreg3_h & xreg0_h { local t:4 = (zext(xreg3_h) << 16) | zext(xreg0_h); export t; }
 
-:MULT^p xreg6_l = MUL0 MMOD1                     is p & op0910=1 & p03=0 & w102=0 & op10001=0 & mm04=0 & MMOD1 ; xw0=1 & xop01112=0 & MUL0 &        xreg6_l           unimpl
-:MULT^p xreg6_h = MUL1 MMLMMOD1                  is p & op0910=1 & p03=0 & w102=1 & op10001=0 & MMLMMOD1       ; xw0=0 & xop01112=0 & MUL1 &                  xreg6_h unimpl
-:MULT^p xreg6_h = MUL1 MML, xreg6_l = MUL0 MMOD1 is p & op0910=1 & p03=0 & w102=1 & op10001=0 & MML & MMOD1    ; xw0=1 & xop01112=0 & MUL0 & MUL1 & xreg6_l & xreg6_h unimpl
+:MULT^p xreg6_l = MUL0 MMOD1                     is p & op0910=1 & p03=0 & w102=0 & op10001=0 & mm04=0 & MMOD1 ; xw0=1 & xop01112=0 & MUL0 &        xreg6_l           { dsp_mult_half(xreg6_l, MUL0, MMOD1); build p; }
+:MULT^p xreg6_h = MUL1 MMLMMOD1                  is p & op0910=1 & p03=0 & w102=1 & op10001=0 & MMLMMOD1       ; xw0=0 & xop01112=0 & MUL1 &                  xreg6_h { dsp_mult_half(xreg6_h, MUL1, MMLMMOD1); build p; }
+:MULT^p xreg6_h = MUL1 MML, xreg6_l = MUL0 MMOD1 is p & op0910=1 & p03=0 & w102=1 & op10001=0 & MML & MMOD1    ; xw0=1 & xop01112=0 & MUL0 & MUL1 & xreg6_l & xreg6_h { local mid1:1 = (MML << 7) | MMOD1; dsp_mult_half(xreg6_h, MUL1, mid1); dsp_mult_half(xreg6_l, MUL0, MMOD1); build p; }
 
-:MULT^p xreg6_e = MUL0 MMODE                     is p & op0910=1 & p03=1 & w102=0 & op10001=0 & mm04=0 & MMODE ; xw0=1 & xop01112=0 & MUL0 &        xreg6_e           unimpl
-:MULT^p xreg6_o = MUL1 MMLMMODE                  is p & op0910=1 & p03=1 & w102=1 & op10001=0 & MMLMMODE       ; xw0=0 & xop01112=0 & MUL1 &                  xreg6_o unimpl
-:MULT^p xreg6_o = MUL1 MML, xreg6_e = MUL0 MMODE is p & op0910=1 & p03=1 & w102=1 & op10001=0 & MML & MMODE    ; xw0=1 & xop01112=0 & MUL0 & MUL1 & xreg6_e & xreg6_o unimpl
+:MULT^p xreg6_e = MUL0 MMODE                     is p & op0910=1 & p03=1 & w102=0 & op10001=0 & mm04=0 & MMODE ; xw0=1 & xop01112=0 & MUL0 &        xreg6_e           { dsp_mult_full(xreg6_e, MUL0, MMODE); build p; }
+:MULT^p xreg6_o = MUL1 MMLMMODE                  is p & op0910=1 & p03=1 & w102=1 & op10001=0 & MMLMMODE       ; xw0=0 & xop01112=0 & MUL1 &                  xreg6_o { dsp_mult_full(xreg6_o, MUL1, MMLMMODE); build p; }
+:MULT^p xreg6_o = MUL1 MML, xreg6_e = MUL0 MMODE is p & op0910=1 & p03=1 & w102=1 & op10001=0 & MML & MMODE    ; xw0=1 & xop01112=0 & MUL0 & MUL1 & xreg6_e & xreg6_o { local mid1:1 = (MML << 7) | MMODE; dsp_mult_full(xreg6_o, MUL1, mid1); dsp_mult_full(xreg6_e, MUL0, MMODE); build p; }
 
 
 #####
@@ -1129,26 +1295,26 @@ MUL1: xreg3_h * xreg0_h is xh01=1 & xh11=1 & xreg3_h & xreg0_h unimpl
 # |.aop...|.s.|.x.|.dest0.....|.dest1.....|.src0......|.src1......|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-SX:         is xsx1213=0 unimpl
-SX: "(co)"  is xsx1213=1 unimpl
-SX: "(s)"   is xsx1213=2 unimpl
-SX: "(sco)" is xsx1213=3 unimpl
+SX:         is xsx1213=0 {  }
+SX: "(co)"  is xsx1213=1 {  }
+SX: "(s)"   is xsx1213=2 {  }
+SX: "(sco)" is xsx1213=3 {  }
 
-SXA:             is xaop1415=0 & xsx1213=0 unimpl
-SXA: "(co)"      is xaop1415=0 & xsx1213=1 unimpl
-SXA: "(s)"       is xaop1415=0 & xsx1213=2 unimpl
-SXA: "(sco)"     is xaop1415=0 & xsx1213=3 unimpl
-SXA: "(asr)"     is xaop1415=2 & xsx1213=0 unimpl
-SXA: "(co,asr)"  is xaop1415=2 & xsx1213=1 unimpl
-SXA: "(s,asr)"   is xaop1415=2 & xsx1213=2 unimpl
-SXA: "(sco,asr)" is xaop1415=2 & xsx1213=3 unimpl
-SXA: "(asl)"     is xaop1415=3 & xsx1213=0 unimpl
-SXA: "(co,asl)"  is xaop1415=3 & xsx1213=1 unimpl
-SXA: "(s,asl)"   is xaop1415=3 & xsx1213=2 unimpl
-SXA: "(sco,asl)" is xaop1415=3 & xsx1213=3 unimpl
+SXA:             is xaop1415=0 & xsx1213=0 {  }
+SXA: "(co)"      is xaop1415=0 & xsx1213=1 {  }
+SXA: "(s)"       is xaop1415=0 & xsx1213=2 {  }
+SXA: "(sco)"     is xaop1415=0 & xsx1213=3 {  }
+SXA: "(asr)"     is xaop1415=2 & xsx1213=0 {  }
+SXA: "(co,asr)"  is xaop1415=2 & xsx1213=1 {  }
+SXA: "(s,asr)"   is xaop1415=2 & xsx1213=2 {  }
+SXA: "(sco,asr)" is xaop1415=2 & xsx1213=3 {  }
+SXA: "(asl)"     is xaop1415=3 & xsx1213=0 {  }
+SXA: "(co,asl)"  is xaop1415=3 & xsx1213=1 {  }
+SXA: "(s,asl)"   is xaop1415=3 & xsx1213=2 {  }
+SXA: "(sco,asl)" is xaop1415=3 & xsx1213=3 {  }
 
-SAT: "(ns)" is xs13=0 unimpl
-SAT: "(s)"  is xs13=1 unimpl
+SAT: "(ns)" is xs13=0 {  }
+SAT: "(s)"  is xs13=1 {  }
 
 DDST0: xreg9_h is hl05=1 ; xreg9_h { export xreg9_h; }
 DDST0: xreg9_l is hl05=0 ; xreg9_l { export xreg9_l; }
@@ -1159,13 +1325,13 @@ DSRC0: xreg3_h is xop15=1 & xreg3_h { export xreg3_h; }
 DSRC1: xreg0_l is xop14=0 & xreg0_l { export xreg0_l; }
 DSRC1: xreg0_h is xop14=1 & xreg0_h { export xreg0_h; }
 
-PAIR0: "R1:0" is xreg3=0 unimpl
-PAIR0: "R3:2" is xreg3=2 unimpl
+PAIR0: "R1:0" is xreg3=0 { export R0; }
+PAIR0: "R3:2" is xreg3=2 { export R2; }
 
-PAIR1: "R1:0" is xreg0=0 unimpl
-PAIR1: "R3:2" is xreg0=2 unimpl
+PAIR1: "R1:0" is xreg0=0 { export R0; }
+PAIR1: "R3:2" is xreg0=2 { export R2; }
 
-:ADD^p    xreg9 = xreg3 +|+ xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=0 & SX & xreg9 & xreg3 & xreg0 unimpl
+:ADD^p    xreg9 = xreg3 +|+ xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=0 & SX & xreg9 & xreg3 & xreg0 { vec_add(xreg9, xreg3, xreg0); build p; }
 :ADD^p    xreg9 = xreg3 +|+ xreg0
     is p & op0610=0x10 & aopc0004=0 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg9_h & xreg9_l & xreg3 & xreg3_h & xreg3_l & xreg0 & xreg0_h & xreg0_l
 {
@@ -1181,9 +1347,9 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     xreg9_h = tmp;
     build p;
 }
-:ADDSUB^p xreg9 = xreg3 +|- xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=1 & SX & xreg9 & xreg3 & xreg0 unimpl
-:ADDSUB^p xreg9 = xreg3 -|+ xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=2 & SX & xreg9 & xreg3 & xreg0 unimpl
-:SUB^p    xreg9 = xreg3 -|- xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=3 & SX & xreg9 & xreg3 & xreg0 unimpl
+:ADDSUB^p xreg9 = xreg3 +|- xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=1 & SX & xreg9 & xreg3 & xreg0 { vec_addsub(xreg9, xreg3, xreg0); build p; }
+:ADDSUB^p xreg9 = xreg3 -|+ xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=2 & SX & xreg9 & xreg3 & xreg0 { vec_subadd(xreg9, xreg3, xreg0); build p; }
+:SUB^p    xreg9 = xreg3 -|- xreg0 SX is p & op0610=0x10 & aopc0004=0 ; xaop1415=3 & SX & xreg9 & xreg3 & xreg0 { vec_sub(xreg9, xreg3, xreg0); build p; }
 :SUB^p    xreg9 = xreg3 -|- xreg0
     is p & op0610=0x10 & aopc0004=0 ; xaop1415=3 & xsx1213=0 & xreg9 & xreg9_h & xreg9_l & xreg3 & xreg3_h & xreg3_l & xreg0 & xreg0_h & xreg0_l
 {
@@ -1200,10 +1366,10 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     build p;
 }
 
-:ADDSUB^p xreg6 = xreg3 +|+ xreg0, xreg9 = xreg3_2 -|- xreg0_2 SXA is p & op0610=0x10 & hl05=0 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 unimpl
-:ADDSUB^p xreg6 = xreg3 +|- xreg0, xreg9 = xreg3_2 -|+ xreg0_2 SXA is p & op0610=0x10 & hl05=1 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 unimpl
+:ADDSUB^p xreg6 = xreg3 +|+ xreg0, xreg9 = xreg3_2 -|- xreg0_2 SXA is p & op0610=0x10 & hl05=0 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 { vec_add(xreg6, xreg3, xreg0); vec_sub(xreg9, xreg3_2, xreg0_2); build p; }
+:ADDSUB^p xreg6 = xreg3 +|- xreg0, xreg9 = xreg3_2 -|+ xreg0_2 SXA is p & op0610=0x10 & hl05=1 & aopc0004=1 ; SXA & xreg9 & xreg6 & xreg3 & xreg3_2 & xreg0 & xreg0_2 { vec_addsub(xreg6, xreg3, xreg0); vec_subadd(xreg9, xreg3_2, xreg0_2); build p; }
 
-:ADD^p DDST0 = DSRC0 + DSRC1 "(s)" is (p & op0610=0x10 & aopc0004=2 ; xx12=0 & xs13=1 & DSRC0 & DSRC1) & DDST0 unimpl
+:ADD^p DDST0 = DSRC0 + DSRC1 "(s)" is (p & op0610=0x10 & aopc0004=2 ; xx12=0 & xs13=1 & DSRC0 & DSRC1) & DDST0 { DDST0 = DSRC0 + DSRC1; build p; }
 :ADD^p DDST0 = DSRC0 + DSRC1 "(ns)"
     is (p & op0610=0x10 & aopc0004=2 ; xx12=0 & xs13=0 & DSRC0 & DSRC1) & DDST0
 {
@@ -1211,7 +1377,7 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     build p;
 }
 
-:SUB^p DDST0 = DSRC0 - DSRC1 "(s)" is (p & op0610=0x10 & aopc0004=3 ; xx12=0 & xs13=1 & DSRC0 & DSRC1) & DDST0 unimpl
+:SUB^p DDST0 = DSRC0 - DSRC1 "(s)" is (p & op0610=0x10 & aopc0004=3 ; xx12=0 & xs13=1 & DSRC0 & DSRC1) & DDST0 { DDST0 = DSRC0 - DSRC1; build p; }
 :SUB^p DDST0 = DSRC0 - DSRC1 "(ns)"
     is (p & op0610=0x10 & aopc0004=3 ; xx12=0 & xs13=0 & DSRC0 & DSRC1) & DDST0
 {
@@ -1219,14 +1385,14 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     build p;
 }
 
-:ADD^p xreg9 = xreg3 + xreg0 "(s)" is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=0 & xx12=0 & xs13=1 & xreg9 & xreg3 & xreg0 unimpl
+:ADD^p xreg9 = xreg3 + xreg0 "(s)" is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=0 & xx12=0 & xs13=1 & xreg9 & xreg3 & xreg0 { xreg9 = xreg3 + xreg0; build p; }
 :ADD^p xreg9 = xreg3 + xreg0 "(ns)"
     is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=0 & xx12=0 & xs13=0 & xreg9 & xreg3 & xreg0
 {
     xreg9 = xreg3 + xreg0;
     build p;
 }
-:SUB^p xreg9 = xreg3 - xreg0 "(s)" is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=1 & xx12=0 & xs13=1 & xreg9 & xreg3 & xreg0 unimpl
+:SUB^p xreg9 = xreg3 - xreg0 "(s)" is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=1 & xx12=0 & xs13=1 & xreg9 & xreg3 & xreg0 { xreg9 = xreg3 - xreg0; build p; }
 :SUB^p xreg9 = xreg3 - xreg0 "(ns)"
     is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=1 & xx12=0 & xs13=0 & xreg9 & xreg3 & xreg0
 {
@@ -1234,16 +1400,20 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     build p;
 }
 
-:ADDSUB^p xreg6 = xreg3 + xreg0, xreg9 = xreg3_2 - xreg0_2 SAT is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=2 & xx12=0 & SAT & xreg9 & xreg6 & xreg3_2 & xreg3 & xreg0_2 & xreg0 unimpl
+# Dual cross add/subtract (saturation not modeled, consistent with the rest).
+:ADDSUB^p xreg6 = xreg3 + xreg0, xreg9 = xreg3_2 - xreg0_2 SAT is p & op0610=0x10 & aopc0004=4 & hl05=0 ; xaop1415=2 & xx12=0 & SAT & xreg9 & xreg6 & xreg3_2 & xreg3 & xreg0_2 & xreg0 { xreg6 = xreg3 + xreg0; xreg9 = xreg3_2 - xreg0_2; build p; }
 
-:ADD^p DDST0 = xreg3 + xreg0 "(rnd12)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0) & DDST0 unimpl
-:SUB^p DDST0 = xreg3 - xreg0 "(rnd12)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg3 & xreg0) & DDST0 unimpl
-:ADD^p DDST0 = xreg3 + xreg0 "(rnd20)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=2 & xsx1213=1 & xreg9 & xreg3 & xreg0) & DDST0 unimpl
-:SUB^p DDST0 = xreg3 - xreg0 "(rnd20)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=3 & xsx1213=1 & xreg9 & xreg3 & xreg0) & DDST0 unimpl
+# Round-12/Round-20 (ISR 10.17/10.18): add/sub two 32-bit values into a wider
+# intermediate (the ISR right-shifts the inputs to avoid overflow), bias by
+# (1<<11)/(1<<19), arithmetic-shift right 12/20, save 16 bits. Saturation omitted.
+:ADD^p DDST0 = xreg3 + xreg0 "(rnd12)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0) & DDST0 { local s:8 = sext(xreg3) + sext(xreg0); s = (s + 0x800) s>> 12; DDST0 = s:2; build p; }
+:SUB^p DDST0 = xreg3 - xreg0 "(rnd12)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg3 & xreg0) & DDST0 { local s:8 = sext(xreg3) - sext(xreg0); s = (s + 0x800) s>> 12; DDST0 = s:2; build p; }
+:ADD^p DDST0 = xreg3 + xreg0 "(rnd20)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=2 & xsx1213=1 & xreg9 & xreg3 & xreg0) & DDST0 { local s:8 = sext(xreg3) + sext(xreg0); s = (s + 0x80000) s>> 20; DDST0 = s:2; build p; }
+:SUB^p DDST0 = xreg3 - xreg0 "(rnd20)" is (p & op0610=0x10 & aopc0004=5 ; xaop1415=3 & xsx1213=1 & xreg9 & xreg3 & xreg0) & DDST0 { local s:8 = sext(xreg3) - sext(xreg0); s = (s + 0x80000) s>> 20; DDST0 = s:2; build p; }
 
-:MAX^p xreg9 = "max"(xreg3, xreg0) "(v)" is p & op0610=0x10 & hl05=0 & aopc0004=6 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0 unimpl
-:MIN^p xreg9 = "min"(xreg3, xreg0) "(v)" is p & op0610=0x10 & hl05=0 & aopc0004=6 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg3 & xreg0 unimpl
-:ABS^p xreg9 = "abs" xreg3 "(v)"         is p & op0610=0x10 & hl05=0 & aopc0004=6 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg3         unimpl
+:MAX^p xreg9 = "max"(xreg3, xreg0) "(v)" is p & op0610=0x10 & hl05=0 & aopc0004=6 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0 { local th:4=xreg3>>16; local h3:2=th:2; local oh:4=xreg0>>16; local h0:2=oh:2; local l3:2=xreg3:2; local l0:2=xreg0:2; local mh:2; ternary(mh,(h3 s> h0),h3,h0); local ml:2; ternary(ml,(l3 s> l0),l3,l0); local zh:4=zext(mh); xreg9 = (zh<<16)|zext(ml); build p; }
+:MIN^p xreg9 = "min"(xreg3, xreg0) "(v)" is p & op0610=0x10 & hl05=0 & aopc0004=6 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg3 & xreg0 { local th:4=xreg3>>16; local h3:2=th:2; local oh:4=xreg0>>16; local h0:2=oh:2; local l3:2=xreg3:2; local l0:2=xreg0:2; local mh:2; ternary(mh,(h3 s< h0),h3,h0); local ml:2; ternary(ml,(l3 s< l0),l3,l0); local zh:4=zext(mh); xreg9 = (zh<<16)|zext(ml); build p; }
+:ABS^p xreg9 = "abs" xreg3 "(v)"         is p & op0610=0x10 & hl05=0 & aopc0004=6 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg3         { local hi:4 = xreg3 >> 16; local lo:2 = xreg3:2; local ah:4; if (hi s< 0) goto <h0>; ah = hi; goto <h1>; <h0> ah = (0-hi)&0xffff; <h1> local al:2 = lo; if (lo s>= 0) goto <l1>; al = -lo; <l1> xreg9 = (ah << 16) | zext(al); build p; }
 
 :MAX^p xreg9 = "max"(xreg3, xreg0) is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0
 {
@@ -1255,95 +1425,143 @@ PAIR1: "R3:2" is xreg0=2 unimpl
     ternary(xreg9, (xreg3 s< xreg0), xreg3, xreg0);
     build p;
 }
-:ABS^p xreg9 = "abs" xreg3   is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg3         unimpl
-:NEG^p xreg9 = -xreg3 "(s)"  is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=3 & xx12=0 & xs13=1 & xreg9 & xreg3   unimpl
+# Saturating absolute value (0x80000000 -> 0x7fffffff). Matches sim "R = ABS R".
+:ABS^p xreg9 = "abs" xreg3   is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg3         {
+    local v:4 = xreg3;
+    if (v s>= 0) goto <pos>;
+        v = -v;
+    <pos>
+    if (v != 0x80000000) goto <nosat>;
+        v = 0x7fffffff;
+    <nosat>
+    xreg9 = v;
+    build p;
+}
+# Saturating negate (signed). 0x80000000 -> 0x7fffffff.
+:NEG^p xreg9 = -xreg3 "(s)"  is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=3 & xx12=0 & xs13=1 & xreg9 & xreg3   {
+    local v:4 = -xreg3;
+    if (xreg3 != 0x80000000) goto <nosat>;
+        v = 0x7fffffff;
+    <nosat>
+    xreg9 = v;
+    build p;
+}
 :NEG^p xreg9 = -xreg3 "(ns)" is p & op0610=0x10 & hl05=0 & aopc0004=7 ; xaop1415=3 & xx12=0 & xs13=0 & xreg9 & xreg3 { xreg9 = -xreg3; build p;}
 
 :CLR^p A0 = 0          is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=0 & xsx1213=0 & A0 { A0 = 0; build p;}
-:SAT^p A0 = "A0" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=0 & xsx1213=2 & A0 unimpl
+:SAT^p A0 = "A0" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=0 & xsx1213=2 & A0 { local a:8=A0; A0=sext(a:4); build p; }
 :CLR^p A1 = 0          is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=1 & xsx1213=0 & A1 { A1 = 0; build p;}
-:SAT^p A1 = "A1" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=1 & xsx1213=2 & A1 unimpl
+:SAT^p A1 = "A1" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=1 & xsx1213=2 & A1 { local a:8=A1; A1=sext(a:4); build p; }
 :CLR^p A1 = A0 = 0     is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=2 & xsx1213=0 & A1 & A0 { A0 = 0; A1 = 0; build p;}
-:SAT^p A1 = "A1" "(s)", A0 = "A0" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=2 & xsx1213=2 & A1 & A0 unimpl
+:SAT^p A1 = "A1" "(s)", A0 = "A0" "(s)" is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=2 & xsx1213=2 & A1 & A0 { local a0:8=A0; A0=sext(a0:4); local a1:8=A1; A1=sext(a1:4); build p; }
 :MOVE^p A0 = A1        is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=3 & xsx1213=0 & A1 & A0 { A0 = A1; build p;}
 :MOVE^p A1 = A0        is p & op0610=0x10 & hl05=0 & aopc0004=8 ; xaop1415=3 & xsx1213=2 & A1 & A0 { A1 = A0; build p;}
 
 :MOVE^p A0.L = xreg3_l is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=0 & xsx1213=0 & A0.L & xreg3_l { A0.L = xreg3_l; build p;}
 :MOVE^p A0.H = xreg3_h is p & op0610=0x10 & hl05=1 & aopc0004=9 ; xaop1415=0 & xsx1213=0 & A0.H & xreg3_h { A0.H = xreg3_h; build p;}
-:MOVE^p A0 = xreg3     is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=0 & xsx1213=2 & A0 & xreg3 unimpl
-:MOVE^p A0.X = xreg3_l is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=1 & xsx1213=0 & A0.X & xreg3_l unimpl
+:MOVE^p A0 = xreg3     is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=0 & xsx1213=2 & A0 & xreg3 { A0 = sext(xreg3); build p; }
+:MOVE^p A0.X = xreg3_l is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=1 & xsx1213=0 & A0.X & xreg3_l { A0.X = sext(xreg3_l); build p; }
 :MOVE^p A1.L = xreg3_l is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=2 & xsx1213=0 & A1.L & xreg3_l { A1.L = xreg3_l; build p;}
 :MOVE^p A1.H = xreg3_h is p & op0610=0x10 & hl05=1 & aopc0004=9 ; xaop1415=2 & xsx1213=0 & A1.H & xreg3_h { A1.H = xreg3_h; build p;}
-:MOVE^p A1 = xreg3     is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=2 & xsx1213=2 & A1 & xreg3 unimpl
-:MOVE^p A1.X = xreg3_l is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=3 & xsx1213=0 & A1.X & xreg3_l unimpl
+:MOVE^p A1 = xreg3     is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=2 & xsx1213=2 & A1 & xreg3 { A1 = sext(xreg3); build p; }
+:MOVE^p A1.X = xreg3_l is p & op0610=0x10 & hl05=0 & aopc0004=9 ; xaop1415=3 & xsx1213=0 & A1.X & xreg3_l { A1.X = sext(xreg3_l); build p; }
 
-:MOVE^p xreg9_l = A0.X is p & op0610=0x10 & hl05=0 & aopc0004=10 ; xaop1415=0 & xsx1213=0 & A0.X & xreg9_l unimpl
-:MOVE^p xreg9_l = A1.X is p & op0610=0x10 & hl05=0 & aopc0004=10 ; xaop1415=1 & xsx1213=0 & A1.X & xreg9_l unimpl
+:MOVE^p xreg9_l = A0.X is p & op0610=0x10 & hl05=0 & aopc0004=10 ; xaop1415=0 & xsx1213=0 & A0.X & xreg9_l { local x:4 = A0.X; xreg9_l = x:2; build p; }
+:MOVE^p xreg9_l = A1.X is p & op0610=0x10 & hl05=0 & aopc0004=10 ; xaop1415=1 & xsx1213=0 & A1.X & xreg9_l { local x:4 = A1.X; xreg9_l = x:2; build p; }
 
-:MOVE^p xreg9 = (A0 += A1) is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=0 & xsx1213=0 & xreg9 & A0 & A1 unimpl
-:MOVE^p DDST0 = (A0 += A1) is (p & op0610=0x10 &         aopc0004=11 ; xaop1415=1 & xsx1213=0 & A0 & A1) & DDST0 unimpl
+:MOVE^p xreg9 = (A0 += A1) is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=0 & xsx1213=0 & xreg9 & A0 & A1 { A0 = A0 + A1; local a:8 = A0; xreg9 = a:4; build p; }
+:MOVE^p DDST0 = (A0 += A1) is (p & op0610=0x10 &         aopc0004=11 ; xaop1415=1 & xsx1213=0 & A0 & A1) & DDST0 { A0 = A0 + A1; local a:8 = A0; DDST0 = a:2; build p; }
 :ADD^p A0 += A1            is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=2 & xsx1213=0 & A0 & A1 { A0 = (A0+A1) & 0xffffffffff; build p;}
-:ADD^p A0 += A1 "(w32)"    is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=2 & xsx1213=2 & A0 & A1 unimpl
-:SUB^p A0 -= A1            is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=3 & xsx1213=0 & A0 & A1 unimpl
-:SUB^p A0 -= A1 "(w32)"    is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=3 & xsx1213=2 & A0 & A1 unimpl
+# w32 is the 32-bit-saturating variant; saturation left unmodeled (as elsewhere).
+:ADD^p A0 += A1 "(w32)"    is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=2 & xsx1213=2 & A0 & A1 { A0 = (A0 + A1) & 0xffffffffff; build p; }
+:SUB^p A0 -= A1            is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=3 & xsx1213=0 & A0 & A1 { A0 = (A0 - A1) & 0xffffffffff; build p; }
+:SUB^p A0 -= A1 "(w32)"    is p & op0610=0x10 & hl05=0 & aopc0004=11 ; xaop1415=3 & xsx1213=2 & A0 & A1 { A0 = (A0 - A1) & 0xffffffffff; build p; }
 
-:ADD^p xreg9_h = xreg9_l = "sign"(xreg3_h) * xreg0_h + "sign"(xreg3_l) * xreg0_l is p & op0610=0x10 & hl05=0 & aopc0004=12 ; xaop1415=0 & xsx1213=0 & xreg9_h & xreg9_l & xreg3_h & xreg3_l & xreg0_h & xreg0_l unimpl
-:ADD^p xreg6 = A1.L + A1.H, xreg9 = A0.L + A0.H is p & op0610=0x10 & hl05=0 & aopc0004=12 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & A0.L & A0.H & A1.L & A1.H unimpl
-:MOVE^p DDST0 = xreg3 "(rnd)" is (p & op0610=0x10 & aopc0004=12 ; xaop1415=3 & xsx1213=0 & xreg3) & DDST0 unimpl
+# Add-on-sign (ISR 14.1): sign-adjust src1 by the SIGN of src0, then sum the two
+# halves into both halves of the destination. Per the ISR the arithmetic sign is
+# (+1) or (-1) decided by the sign BIT alone (no zero case: src0>=0 => +src1).
+:ADD^p xreg9_h = xreg9_l = "sign"(xreg3_h) * xreg0_h + "sign"(xreg3_l) * xreg0_l is p & op0610=0x10 & hl05=0 & aopc0004=12 ; xaop1415=0 & xsx1213=0 & xreg9_h & xreg9_l & xreg3_h & xreg3_l & xreg0_h & xreg0_l {
+    local ph:2;
+    if (xreg3_h s< 0) goto <hneg>;
+        ph = xreg0_h; goto <h0>;
+    <hneg>
+        ph = -xreg0_h;
+    <h0>
+    local pl:2;
+    if (xreg3_l s< 0) goto <lneg>;
+        pl = xreg0_l; goto <l0>;
+    <lneg>
+        pl = -xreg0_l;
+    <l0>
+    local r:2 = ph + pl;
+    xreg9_h = r;
+    xreg9_l = r;
+    build p;
+}
+:ADD^p xreg6 = A1.L + A1.H, xreg9 = A0.L + A0.H is p & op0610=0x10 & hl05=0 & aopc0004=12 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & A0.L & A0.H & A1.L & A1.H { xreg6 = sext(A1.L) + sext(A1.H); xreg9 = sext(A0.L) + sext(A0.H); build p; }
+:MOVE^p DDST0 = xreg3 "(rnd)" is (p & op0610=0x10 & aopc0004=12 ; xaop1415=3 & xsx1213=0 & xreg3) & DDST0 { local r:4 = (xreg3 + 0x8000) >> 16; DDST0 = r:2; build p; }
 
-:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(gt)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg6 & xreg3 unimpl
-:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(ge)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & xreg3 unimpl
-:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(lt)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg6 & xreg3 unimpl
-:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(le)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=3 & xsx1213=0 & xreg9 & xreg6 & xreg3 unimpl
+# Vector search (ISR 14.13): compares the two 16-bit halves of xreg3 against the
+# running extrema in A0/A1, conditionally updating both accumulators and the two
+# destination registers (index from P0). A0/A1 are read and clobbered; the exact
+# extremum/index pick is opaque (search mode is in the disassembly).
+:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(gt)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg6 & xreg3 { local v6:4 = search(xreg3, A0, A1, 0:1); local v9:4 = search(xreg3, A0, A1, 1:1); local na0:8 = search(xreg3, A0, A1, 2:1); local na1:8 = search(xreg3, A0, A1, 3:1); xreg6 = v6; xreg9 = v9; A0 = na0; A1 = na1; build p; }
+:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(ge)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & xreg3 { local v6:4 = search(xreg3, A0, A1, 0:1); local v9:4 = search(xreg3, A0, A1, 1:1); local na0:8 = search(xreg3, A0, A1, 2:1); local na1:8 = search(xreg3, A0, A1, 3:1); xreg6 = v6; xreg9 = v9; A0 = na0; A1 = na1; build p; }
+:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(lt)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=2 & xsx1213=0 & xreg9 & xreg6 & xreg3 { local v6:4 = search(xreg3, A0, A1, 0:1); local v9:4 = search(xreg3, A0, A1, 1:1); local na0:8 = search(xreg3, A0, A1, 2:1); local na1:8 = search(xreg3, A0, A1, 3:1); xreg6 = v6; xreg9 = v9; A0 = na0; A1 = na1; build p; }
+:SEARCH^p (xreg6, xreg9) = "search" xreg3 "(le)" is p & op0610=0x10 & hl05=0 & aopc0004=13 ; xaop1415=3 & xsx1213=0 & xreg9 & xreg6 & xreg3 { local v6:4 = search(xreg3, A0, A1, 0:1); local v9:4 = search(xreg3, A0, A1, 1:1); local na0:8 = search(xreg3, A0, A1, 2:1); local na1:8 = search(xreg3, A0, A1, 3:1); xreg6 = v6; xreg9 = v9; A0 = na0; A1 = na1; build p; }
 
-:NEG^p A0 = -"A0" is p & op0610=0x10 & hl05=0 & aopc0004=14 ; xaop1415=0 & xsx1213=0 & A0 unimpl
-:NEG^p A1 = -A0   is p & op0610=0x10 & hl05=1 & aopc0004=14 ; xaop1415=0 & xsx1213=0 & A1 & A0 unimpl
-:NEG^p A0 = -A1   is p & op0610=0x10 & hl05=0 & aopc0004=14 ; xaop1415=1 & xsx1213=0 & A1 & A0 unimpl
-:NEG^p A1 = -"A1" is p & op0610=0x10 & hl05=1 & aopc0004=14 ; xaop1415=1 & xsx1213=0 & A1 unimpl
-:NEG^p A1 = -"A1", A0 = -"A0" is p & op0610=0x10 & hl05=0 & aopc0004=14 ; xaop1415=3 & xsx1213=0 & A1 & A0 unimpl
+:NEG^p A0 = -"A0" is p & op0610=0x10 & hl05=0 & aopc0004=14 ; xaop1415=0 & xsx1213=0 & A0 { A0 = -A0; build p; }
+:NEG^p A1 = -A0   is p & op0610=0x10 & hl05=1 & aopc0004=14 ; xaop1415=0 & xsx1213=0 & A1 & A0 { A1 = -A0; build p; }
+:NEG^p A0 = -A1   is p & op0610=0x10 & hl05=0 & aopc0004=14 ; xaop1415=1 & xsx1213=0 & A1 & A0 { A0 = -A1; build p; }
+:NEG^p A1 = -"A1" is p & op0610=0x10 & hl05=1 & aopc0004=14 ; xaop1415=1 & xsx1213=0 & A1 { A1 = -A1; build p; }
+:NEG^p A1 = -"A1", A0 = -"A0" is p & op0610=0x10 & hl05=0 & aopc0004=14 ; xaop1415=3 & xsx1213=0 & A1 & A0 { A1 = -A1; A0 = -A0; build p; }
 
-:NEG^p xreg9 = -xreg3 "(v)" is p & op0610=0x10 & hl05=0 & aopc0004=15 ; xaop1415=3 & xsx1213=0 & xreg9 & xreg3 unimpl
+:NEG^p xreg9 = -xreg3 "(v)" is p & op0610=0x10 & hl05=0 & aopc0004=15 ; xaop1415=3 & xsx1213=0 & xreg9 & xreg3 { local h:4 = ((0 - (xreg3 >> 16)) << 16); local l:4 = (0 - xreg3) & 0xffff; xreg9 = h | l; build p; }
 
-:ABS^p A0 = "abs" "A0" is p & op0610=0x10 & hl05=0 & aopc0004=16 ; xaop1415=0 & xsx1213=0 & A0 unimpl
-:ABS^p A1 = "abs" A0   is p & op0610=0x10 & hl05=1 & aopc0004=16 ; xaop1415=0 & xsx1213=0 & A1 & A0 unimpl
-:ABS^p A0 = "abs" A1   is p & op0610=0x10 & hl05=0 & aopc0004=16 ; xaop1415=1 & xsx1213=0 & A1 & A0 unimpl
-:ABS^p A1 = "abs" "A1" is p & op0610=0x10 & hl05=1 & aopc0004=16 ; xaop1415=1 & xsx1213=0 & A1 unimpl
-:ABS^p A1 = "abs" "A1", A0 = "abs" "A0" is p & op0610=0x10 & hl05=0 & aopc0004=16 ; xaop1415=3 & xsx1213=0 & A1 & A0 unimpl
+:ABS^p A0 = "abs" "A0" is p & op0610=0x10 & hl05=0 & aopc0004=16 ; xaop1415=0 & xsx1213=0 & A0 { if (A0 s>= 0) goto <pa>; A0 = -A0; <pa> build p; }
+:ABS^p A1 = "abs" A0   is p & op0610=0x10 & hl05=1 & aopc0004=16 ; xaop1415=0 & xsx1213=0 & A1 & A0 { local v:8 = A0; if (v s>= 0) goto <pa>; v = -v; <pa> A1 = v; build p; }
+:ABS^p A0 = "abs" A1   is p & op0610=0x10 & hl05=0 & aopc0004=16 ; xaop1415=1 & xsx1213=0 & A1 & A0 { local v:8 = A1; if (v s>= 0) goto <pa>; v = -v; <pa> A0 = v; build p; }
+:ABS^p A1 = "abs" "A1" is p & op0610=0x10 & hl05=1 & aopc0004=16 ; xaop1415=1 & xsx1213=0 & A1 { if (A1 s>= 0) goto <pa>; A1 = -A1; <pa> build p; }
+:ABS^p A1 = "abs" "A1", A0 = "abs" "A0" is p & op0610=0x10 & hl05=0 & aopc0004=16 ; xaop1415=3 & xsx1213=0 & A1 & A0 { if (A1 s>= 0) goto <p1>; A1 = -A1; <p1> if (A0 s>= 0) goto <p0>; A0 = -A0; <p0> build p; }
 
-:ADDSUB^p xreg6 = "A1" + "A0", xreg9 = "A1" - "A0" SAT is p & op0610=0x10 & hl05=0 & aopc0004=17 ; xaop1415=0 & xx12=0 & SAT & xreg9 & xreg6 unimpl
-:ADDSUB^p xreg6 = "A0" + "A1", xreg9 = "A0" - "A1" SAT is p & op0610=0x10 & hl05=0 & aopc0004=17 ; xaop1415=1 & xx12=0 & SAT & xreg9 & xreg6 unimpl
+:ADDSUB^p xreg6 = "A1" + "A0", xreg9 = "A1" - "A0" SAT is p & op0610=0x10 & hl05=0 & aopc0004=17 ; xaop1415=0 & xx12=0 & SAT & xreg9 & xreg6 { local s:8=A1+A0; xreg6=s:4; local d:8=A1-A0; xreg9=d:4; build p; }
+:ADDSUB^p xreg6 = "A0" + "A1", xreg9 = "A0" - "A1" SAT is p & op0610=0x10 & hl05=0 & aopc0004=17 ; xaop1415=1 & xx12=0 & SAT & xreg9 & xreg6 { local s:8=A0+A1; xreg6=s:4; local d:8=A0-A1; xreg9=d:4; build p; }
 
-:SAA^p (PAIR0, PAIR1)       is p & op0610=0x10 & hl05=0 & aopc0004=18 ; xaop1415=0 & xsx1213=0 & PAIR0 & PAIR1 unimpl
-:SAA^p (PAIR0, PAIR1) "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=18 ; xaop1415=0 & xsx1213=2 & PAIR0 & PAIR1 unimpl
-:DISALGNEXCPT^p             is p & op0610=0x10 & hl05=0 & aopc0004=18 ; xaop1415=3 & xsx1213=0 unimpl
+# Subtract-Absolute-Accumulate (motion estimation): A0/A1 += sum of 4 |byte diffs|.
+:SAA^p (PAIR0, PAIR1)       is p & op0610=0x10 & hl05=0 & aopc0004=18 ; xaop1415=0 & xsx1213=0 & PAIR0 & PAIR1 { A0 = saa(A0, PAIR0, PAIR1); A1 = saa(A1, PAIR0, PAIR1); build p; }
+:SAA^p (PAIR0, PAIR1) "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=18 ; xaop1415=0 & xsx1213=2 & PAIR0 & PAIR1 { A0 = saa(A0, PAIR0, PAIR1); A1 = saa(A1, PAIR0, PAIR1); build p; }
+:DISALGNEXCPT^p             is p & op0610=0x10 & hl05=0 & aopc0004=18 ; xaop1415=3 & xsx1213=0 { disalgnexcpt(); build p; }
 
-:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1)         is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1) "(r)"   is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1) "(t)"   is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=1 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1) "(t,r)" is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=1 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
+# Quad-8 byte averages (byteop1p/2p/3p) and dual-16 add/clip (byteop16p/16m).
+# The packed-byte arithmetic is modeled opaquely via pcodeops (rounding/half
+# mode visible in the disassembly); removes the unimplemented halt.
+:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1)         is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 1:1); build p; }
+:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1) "(r)"   is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 1:1); build p; }
+:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1) "(t)"   is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=1 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 1:1); build p; }
+:AVG^p xreg9 = "byteop1p"(PAIR0, PAIR1) "(t,r)" is p & op0610=0x10 & hl05=0 & aopc0004=20 ; xaop1415=1 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 1:1); build p; }
 
-:ADD^p (xreg6, xreg9) = "byteop16p"(PAIR0, PAIR1)       is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg6 & PAIR0 & PAIR1 unimpl
-:ADD^p (xreg6, xreg9) = "byteop16p"(PAIR0, PAIR1) "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=0 & xsx1213=2 & xreg9 & xreg6 & PAIR0 & PAIR1 unimpl
-:SUB^p (xreg6, xreg9) = "byteop16m"(PAIR0, PAIR1)       is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & PAIR0 & PAIR1 unimpl
-:SUB^p (xreg6, xreg9) = "byteop16m"(PAIR0, PAIR1) "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=1 & xsx1213=2 & xreg9 & xreg6 & PAIR0 & PAIR1 unimpl
+:ADD^p (xreg6, xreg9) = "byteop16p"(PAIR0, PAIR1)       is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg6 & PAIR0 & PAIR1 { xreg6 = byteop_addsub(PAIR0, PAIR1, 0:1); xreg9 = byteop_addsub(PAIR0, PAIR1, 1:1); build p; }
+:ADD^p (xreg6, xreg9) = "byteop16p"(PAIR0, PAIR1) "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=0 & xsx1213=2 & xreg9 & xreg6 & PAIR0 & PAIR1 { xreg6 = byteop_addsub(PAIR0, PAIR1, 0:1); xreg9 = byteop_addsub(PAIR0, PAIR1, 1:1); build p; }
+:SUB^p (xreg6, xreg9) = "byteop16m"(PAIR0, PAIR1)       is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & PAIR0 & PAIR1 { xreg6 = byteop_addsub(PAIR0, PAIR1, 2:1); xreg9 = byteop_addsub(PAIR0, PAIR1, 3:1); build p; }
+:SUB^p (xreg6, xreg9) = "byteop16m"(PAIR0, PAIR1) "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=21 ; xaop1415=1 & xsx1213=2 & xreg9 & xreg6 & PAIR0 & PAIR1 { xreg6 = byteop_addsub(PAIR0, PAIR1, 2:1); xreg9 = byteop_addsub(PAIR0, PAIR1, 3:1); build p; }
 
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndl)"   is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndl,r)" is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndh)"   is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndh,r)" is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(tl)"   is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=1 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(tl,r)" is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=1 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(th)"   is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=1 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(th,r)" is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=1 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndl)"   is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndl,r)" is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndh)"   is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(rndh,r)" is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(tl)"   is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=1 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(tl,r)" is p & op0610=0x10 & hl05=0 & aopc0004=22 ; xaop1415=1 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(th)"   is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=1 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
+:AVG^p xreg9 = "byteop2p"(PAIR0, PAIR1) "(th,r)" is p & op0610=0x10 & hl05=1 & aopc0004=22 ; xaop1415=1 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 2:1); build p; }
 
-:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(lo)"   is p & op0610=0x10 & hl05=0 & aopc0004=23 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(lo,r)" is p & op0610=0x10 & hl05=0 & aopc0004=23 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(hi)"   is p & op0610=0x10 & hl05=1 & aopc0004=23 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 unimpl
-:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(hi,r)" is p & op0610=0x10 & hl05=1 & aopc0004=23 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 unimpl
+:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(lo)"   is p & op0610=0x10 & hl05=0 & aopc0004=23 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 3:1); build p; }
+:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(lo,r)" is p & op0610=0x10 & hl05=0 & aopc0004=23 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 3:1); build p; }
+:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(hi)"   is p & op0610=0x10 & hl05=1 & aopc0004=23 ; xaop1415=0 & xsx1213=0 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 3:1); build p; }
+:AVG^p xreg9 = "byteop3p"(PAIR0, PAIR1) "(hi,r)" is p & op0610=0x10 & hl05=1 & aopc0004=23 ; xaop1415=0 & xsx1213=2 & xreg9 & PAIR0 & PAIR1 { xreg9 = byteop_avg(PAIR0, PAIR1, 3:1); build p; }
 
-:PACK^p xreg9 = "bytepack"(xreg3, xreg0)          is p & op0610=0x10 & hl05=0 & aopc0004=24 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0 unimpl
-:PACK^p (xreg6, xreg9) = "byteunpack" PAIR0       is p & op0610=0x10 & hl05=0 & aopc0004=24 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & PAIR0 unimpl
-:PACK^p (xreg6, xreg9) = "byteunpack" PAIR0 "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=24 ; xaop1415=1 & xsx1213=2 & xreg9 & xreg6 & PAIR0 unimpl
+:PACK^p xreg9 = "bytepack"(xreg3, xreg0)          is p & op0610=0x10 & hl05=0 & aopc0004=24 ; xaop1415=0 & xsx1213=0 & xreg9 & xreg3 & xreg0 { xreg9 = bytepack(xreg3, xreg0); build p; }
+:PACK^p (xreg6, xreg9) = "byteunpack" PAIR0       is p & op0610=0x10 & hl05=0 & aopc0004=24 ; xaop1415=1 & xsx1213=0 & xreg9 & xreg6 & PAIR0 { xreg6 = byteunpack(PAIR0, 0:1); xreg9 = byteunpack(PAIR0, 1:1); build p; }
+:PACK^p (xreg6, xreg9) = "byteunpack" PAIR0 "(r)" is p & op0610=0x10 & hl05=0 & aopc0004=24 ; xaop1415=1 & xsx1213=2 & xreg9 & xreg6 & PAIR0 { xreg6 = byteunpack(PAIR0, 0:1); xreg9 = byteunpack(PAIR0, 1:1); build p; }
 
 
 #####
@@ -1360,25 +1578,126 @@ SHRD: xreg9_h is xh13=1 & xreg9_h { export xreg9_h; }
 SHRS: xreg0_l is xh12=0 & xreg0_l { export xreg0_l; }
 SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 
-:ASH^p SHRD = "ashift" SHRS "by" xreg3_l       is p & op0410=0x60 & sopc0003=0 ; xsop1415=0 & xreg6=0 & xreg3_l & SHRD & SHRS unimpl
-:ASH^p SHRD = "ashift" SHRS "by" xreg3_l "(s)" is p & op0410=0x60 & sopc0003=0 ; xsop1415=1 & xreg6=0 & xreg3_l & SHRD & SHRS unimpl
-:LSH^p SHRD = "lshift" SHRS "by" xreg3_l       is p & op0410=0x60 & sopc0003=0 ; xsop1415=2 & xreg6=0 & xreg3_l & SHRD & SHRS unimpl
+:ASH^p SHRD = "ashift" SHRS "by" xreg3_l       is p & op0410=0x60 & sopc0003=0 ; xsop1415=0 & xreg6=0 & xreg3_l & SHRD & SHRS { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <hok>; cnt = raw - 64; <hok> if (cnt s< 0) goto <hr>; SHRD = SHRS << cnt; goto <hf>; <hr> local rc:4 = 0 - cnt; SHRD = SHRS s>> rc; <hf> build p; }
+:ASH^p SHRD = "ashift" SHRS "by" xreg3_l "(s)" is p & op0410=0x60 & sopc0003=0 ; xsop1415=1 & xreg6=0 & xreg3_l & SHRD & SHRS { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <hok>; cnt = raw - 64; <hok> if (cnt s< 0) goto <hr>; SHRD = SHRS << cnt; goto <hf>; <hr> local rc:4 = 0 - cnt; SHRD = SHRS s>> rc; <hf> build p; }
+:LSH^p SHRD = "lshift" SHRS "by" xreg3_l       is p & op0410=0x60 & sopc0003=0 ; xsop1415=2 & xreg6=0 & xreg3_l & SHRD & SHRS { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <hok>; cnt = raw - 64; <hok> if (cnt s< 0) goto <hr>; SHRD = SHRS << cnt; goto <hf>; <hr> local rc:4 = 0 - cnt; SHRD = SHRS >> rc; <hf> build p; }
 
-:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l "(v)"   is p & op0410=0x60 & sopc0003=1 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
-:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l "(v,s)" is p & op0410=0x60 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
-:LSH^p xreg9 = "lshift" xreg0 "by" xreg3_l "(v)"   is p & op0410=0x60 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
+:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l "(v)"   is p & op0410=0x60 & sopc0003=1 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 { local raw:4=zext(xreg3_l)&0x3f; local cnt:4=raw; if (raw s< 0x20) goto <ok>; cnt=raw-64; <ok> local th:4=xreg0>>16; local hh:2=th:2; local ll:2=xreg0:2; if (cnt s< 0) goto <r>; hh=hh<<cnt; ll=ll<<cnt; goto <fn>; <r> local rc:4=0-cnt; hh=hh s>> rc; ll=ll s>> rc; <fn> local zh:4=zext(hh); xreg9=(zh<<16)|zext(ll); build p; }
+:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l "(v,s)" is p & op0410=0x60 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 { local raw:4=zext(xreg3_l)&0x3f; local cnt:4=raw; if (raw s< 0x20) goto <ok>; cnt=raw-64; <ok> local th:4=xreg0>>16; local hh:2=th:2; local ll:2=xreg0:2; if (cnt s< 0) goto <r>; hh=hh<<cnt; ll=ll<<cnt; goto <fn>; <r> local rc:4=0-cnt; hh=hh s>> rc; ll=ll s>> rc; <fn> local zh:4=zext(hh); xreg9=(zh<<16)|zext(ll); build p; }
+:LSH^p xreg9 = "lshift" xreg0 "by" xreg3_l "(v)"   is p & op0410=0x60 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 { local raw:4=zext(xreg3_l)&0x3f; local cnt:4=raw; if (raw s< 0x20) goto <ok>; cnt=raw-64; <ok> local th:4=xreg0>>16; local hh:2=th:2; local ll:2=xreg0:2; if (cnt s< 0) goto <r>; hh=hh<<cnt; ll=ll<<cnt; goto <fn>; <r> local rc:4=0-cnt; hh=hh>>rc; ll=ll>>rc; <fn> local zh:4=zext(hh); xreg9=(zh<<16)|zext(ll); build p; }
 
-:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l       is p & op0410=0x60 & sopc0003=2 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
-:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l "(s)" is p & op0410=0x60 & sopc0003=2 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
-:LSH^p xreg9 = "lshift" xreg0 "by" xreg3_l       is p & op0410=0x60 & sopc0003=2 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
-:ROT^p xreg9 = "rot" xreg0 "by" xreg3_l          is p & op0410=0x60 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 unimpl
+# Register-count shifts: count is low 6 bits of Rsrc.L, sign-extended.
+# Positive => shift left, negative => shift right (arithmetic for ASH, logical for LSH).
+:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l       is p & op0410=0x60 & sopc0003=2 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 {
+    local raw:4 = zext(xreg3_l) & 0x3f;
+    local cnt:4 = raw;
+    if (raw s< 0x20) goto <ok>;
+        cnt = raw - 64;
+    <ok>
+    if (cnt s< 0) goto <right>;
+        xreg9 = xreg0 << cnt;
+        goto <fin>;
+    <right>
+        local rc:4 = 0 - cnt;
+        xreg9 = xreg0 s>> rc;
+    <fin>
+    build p;
+}
+:ASH^p xreg9 = "ashift" xreg0 "by" xreg3_l "(s)" is p & op0410=0x60 & sopc0003=2 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 {
+    local raw:4 = zext(xreg3_l) & 0x3f;
+    local cnt:4 = raw;
+    if (raw s< 0x20) goto <ok>;
+        cnt = raw - 64;
+    <ok>
+    if (cnt s< 0) goto <right>;
+        xreg9 = xreg0 << cnt;
+        goto <fin>;
+    <right>
+        local rc:4 = 0 - cnt;
+        xreg9 = xreg0 s>> rc;
+    <fin>
+    build p;
+}
+:LSH^p xreg9 = "lshift" xreg0 "by" xreg3_l       is p & op0410=0x60 & sopc0003=2 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 {
+    local raw:4 = zext(xreg3_l) & 0x3f;
+    local cnt:4 = raw;
+    if (raw s< 0x20) goto <ok>;
+        cnt = raw - 64;
+    <ok>
+    if (cnt s< 0) goto <right>;
+        xreg9 = xreg0 << cnt;
+        goto <fin>;
+    <right>
+        local rc:4 = 0 - cnt;
+        xreg9 = xreg0 >> rc;
+    <fin>
+    build p;
+}
+# Rotate by register: count is the low 6 bits of Rsrc.L, sign-extended (-32..31).
+:ROT^p xreg9 = "rot" xreg0 "by" xreg3_l          is p & op0410=0x60 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg3_l & xreg9 & xreg0 {
+    local raw:4 = zext(xreg3_l) & 0x3f;
+    local sh:4 = raw;
+    if (raw s< 0x20) goto <signed_ok>;
+        sh = raw - 64;
+    <signed_ok>
+    if (sh != 0) goto <do_rot>;
+        xreg9 = xreg0;
+        goto <fin>;
+    <do_rot>
+    if (sh s>= 0) goto <pos>;
+        sh = sh + 33;
+    <pos>
+    local rr:8 = (zext(CCflag) << 32) | zext(xreg0);
+    rr = ((rr << sh) | (rr >> (33 - sh))) & 0x1FFFFFFFF;
+    local hibit:8 = rr >> 32;
+    CCflag = hibit:1;
+    xreg9 = rr:4;
+    <fin>
+    build p;
+}
 
-:ASH^p A0 = "ashift" "A0" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3_l & A0 unimpl
-:ASH^p A1 = "ashift" "A1" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & xreg6=0 & xreg3_l & A1 unimpl
-:LSH^p A0 = "lshift" "A0" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3_l & A0 unimpl
-:LSH^p A1 = "lshift" "A1" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=1 & xhls1213=1 & xreg6=0 & xreg3_l & A1 unimpl
-:ROT^p A0 = "rot" "A0" "by" xreg3_l    is p & op0410=0x60 & sopc0003=3 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & A0 unimpl
-:ROT^p A1 = "rot" "A1" "by" xreg3_l    is p & op0410=0x60 & sopc0003=3 ; xsop1415=2 & xhls1213=1 & xreg6=0 & xreg3_l & A1 unimpl
+:ASH^p A0 = "ashift" "A0" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3_l & A0 { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <ok>; cnt = raw - 64; <ok> if (cnt s< 0) goto <r>; A0 = A0 << cnt; goto <fn>; <r> local rc:4 = 0 - cnt; A0 = A0 s>> rc; <fn> build p; }
+:ASH^p A1 = "ashift" "A1" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & xreg6=0 & xreg3_l & A1 { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <ok>; cnt = raw - 64; <ok> if (cnt s< 0) goto <r>; A1 = A1 << cnt; goto <fn>; <r> local rc:4 = 0 - cnt; A1 = A1 s>> rc; <fn> build p; }
+:LSH^p A0 = "lshift" "A0" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3_l & A0 { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <ok>; cnt = raw - 64; <ok> if (cnt s< 0) goto <r>; A0 = A0 << cnt; goto <fn>; <r> local rc:4 = 0 - cnt; A0 = A0 >> rc; <fn> build p; }
+:LSH^p A1 = "lshift" "A1" "by" xreg3_l is p & op0410=0x60 & sopc0003=3 ; xsop1415=1 & xhls1213=1 & xreg6=0 & xreg3_l & A1 { local raw:4 = zext(xreg3_l) & 0x3f; local cnt:4 = raw; if (raw s< 0x20) goto <ok>; cnt = raw - 64; <ok> if (cnt s< 0) goto <r>; A1 = A1 << cnt; goto <fn>; <r> local rc:4 = 0 - cnt; A1 = A1 >> rc; <fn> build p; }
+# 41-bit rotate-through-CC of {CC, A[39:0]}, register count (low 6 bits of Rsrc.L,
+# sign-extended). Mirrors the 33-bit Dreg ROT widened to the 40-bit accumulator.
+:ROT^p A0 = "rot" "A0" "by" xreg3_l    is p & op0410=0x60 & sopc0003=3 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg3_l & A0 {
+    local raw:4 = zext(xreg3_l) & 0x3f;
+    local sh:4 = raw;
+    if (raw s< 0x20) goto <ok>;
+        sh = raw - 64;
+    <ok>
+    if (sh == 0) goto <fin>;
+    if (sh s>= 0) goto <pos>;
+        sh = sh + 41;
+    <pos>
+    local rr:8 = (zext(CCflag) << 40) | (A0 & 0xffffffffff);
+    rr = ((rr << sh) | (rr >> (41 - sh))) & 0x1FFFFFFFFFF;
+    local hibit:8 = rr >> 40;
+    CCflag = hibit:1;
+    A0 = rr & 0xffffffffff;
+    <fin>
+    build p;
+}
+:ROT^p A1 = "rot" "A1" "by" xreg3_l    is p & op0410=0x60 & sopc0003=3 ; xsop1415=2 & xhls1213=1 & xreg6=0 & xreg3_l & A1 {
+    local raw:4 = zext(xreg3_l) & 0x3f;
+    local sh:4 = raw;
+    if (raw s< 0x20) goto <ok>;
+        sh = raw - 64;
+    <ok>
+    if (sh == 0) goto <fin>;
+    if (sh s>= 0) goto <pos>;
+        sh = sh + 41;
+    <pos>
+    local rr:8 = (zext(CCflag) << 40) | (A1 & 0xffffffffff);
+    rr = ((rr << sh) | (rr >> (41 - sh))) & 0x1FFFFFFFFFF;
+    local hibit:8 = rr >> 40;
+    CCflag = hibit:1;
+    A1 = rr & 0xffffffffff;
+    <fin>
+    build p;
+}
 
 :PACK^p xreg9 = "pack"(xreg0_l, xreg3_l)
     is p & op0410=0x60 & sopc0003=4 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg9_h & xreg9_l & xreg3_l & xreg0_l
@@ -1410,39 +1729,98 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
     build p;
 }
 
-:SIGN^p xreg9_l = "signbits" xreg0   is p & op0410=0x60 & sopc0003=5 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 unimpl
-:SIGN^p xreg9_l = "signbits" xreg0_l is p & op0410=0x60 & sopc0003=5 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0_l unimpl
-:SIGN^p xreg9_l = "signbits" xreg0_h is p & op0410=0x60 & sopc0003=5 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0_h unimpl
-:SIGN^p xreg9_l = "signbits" A0      is p & op0410=0x60 & sopc0003=6 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & A0 unimpl
-:SIGN^p xreg9_l = "signbits" A1      is p & op0410=0x60 & sopc0003=6 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & A1 unimpl
-:POPCNT^p xreg9_l = "ones" xreg0     is p & op0410=0x60 & sopc0003=6 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 unimpl
+:SIGN^p xreg9_l = "signbits" xreg0   is p & op0410=0x60 & sopc0003=5 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 { local s:4 = signbits(xreg0); xreg9_l = s:2; build p; }
+:SIGN^p xreg9_l = "signbits" xreg0_l is p & op0410=0x60 & sopc0003=5 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0_l { local s:2 = signbits(xreg0_l); xreg9_l = s; build p; }
+:SIGN^p xreg9_l = "signbits" xreg0_h is p & op0410=0x60 & sopc0003=5 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0_h { local s:2 = signbits(xreg0_h); xreg9_l = s; build p; }
+:SIGN^p xreg9_l = "signbits" A0      is p & op0410=0x60 & sopc0003=6 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & A0 { local s:4 = signbits(A0); xreg9_l = s:2; build p; }
+:SIGN^p xreg9_l = "signbits" A1      is p & op0410=0x60 & sopc0003=6 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & A1 { local s:4 = signbits(A1); xreg9_l = s:2; build p; }
+:POPCNT^p xreg9_l = "ones" xreg0     is p & op0410=0x60 & sopc0003=6 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 { local c:4 = popcount(xreg0); xreg9_l = c:2; build p; }
 
-:EXPADJ^p xreg9_l = "expadj"(xreg0, xreg3_l)       is p & op0410=0x60 & sopc0003=7 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0 unimpl
-:EXPADJ^p xreg9_l = "expadj"(xreg0, xreg3_l) "(v)" is p & op0410=0x60 & sopc0003=7 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0 unimpl
-:EXPADJ^p xreg9_l = "expadj"(xreg0_l, xreg3_l)     is p & op0410=0x60 & sopc0003=7 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0_l unimpl
-:EXPADJ^p xreg9_l = "expadj"(xreg0_h, xreg3_l)     is p & op0410=0x60 & sopc0003=7 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0_h unimpl
+:EXPADJ^p xreg9_l = "expadj"(xreg0, xreg3_l)       is p & op0410=0x60 & sopc0003=7 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0 { local e:2 = expadj(xreg0, xreg3_l); xreg9_l = e; build p; }
+:EXPADJ^p xreg9_l = "expadj"(xreg0, xreg3_l) "(v)" is p & op0410=0x60 & sopc0003=7 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0 { local e:2 = expadj(xreg0, xreg3_l); xreg9_l = e; build p; }
+:EXPADJ^p xreg9_l = "expadj"(xreg0_l, xreg3_l)     is p & op0410=0x60 & sopc0003=7 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0_l { local e:2 = expadj(xreg0_l, xreg3_l); xreg9_l = e; build p; }
+:EXPADJ^p xreg9_l = "expadj"(xreg0_h, xreg3_l)     is p & op0410=0x60 & sopc0003=7 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3_l & xreg0_h { local e:2 = expadj(xreg0_h, xreg3_l); xreg9_l = e; build p; }
 
-:BITMUX^p (xreg3, xreg0, A0) "(asr)" is p & op0410=0x60 & sopc0003=8 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3 & xreg0 & A0 unimpl
-:BITMUX^p (xreg3, xreg0, A0) "(asl)" is p & op0410=0x60 & sopc0003=8 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3 & xreg0 & A0 unimpl
+# Bit-multiplex (ISR 8.7): shifts A0 and the two source regs one bit, merging the
+# shifted-out bits. Overwrites source_1 (xreg3), source_0 (xreg0) and A0.
+:BITMUX^p (xreg3, xreg0, A0) "(asr)" is p & op0410=0x60 & sopc0003=8 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg3 & xreg0 & A0 { local n3:4 = bitmux(xreg3, xreg0, A0, 0:1); local n0:4 = bitmux(xreg3, xreg0, A0, 1:1); local na:8 = bitmux(xreg3, xreg0, A0, 2:1); xreg3 = n3; xreg0 = n0; A0 = na; build p; }
+:BITMUX^p (xreg3, xreg0, A0) "(asl)" is p & op0410=0x60 & sopc0003=8 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg3 & xreg0 & A0 { local n3:4 = bitmux(xreg3, xreg0, A0, 3:1); local n0:4 = bitmux(xreg3, xreg0, A0, 4:1); local na:8 = bitmux(xreg3, xreg0, A0, 5:1); xreg3 = n3; xreg0 = n0; A0 = na; build p; }
 
-:VITMAX^p xreg9_l = "vit_max"(xreg0) "(asl)"      is p & op0410=0x60 & sopc0003=9 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 unimpl
-:VITMAX^p xreg9_l = "vit_max"(xreg0) "(asr)"      is p & op0410=0x60 & sopc0003=9 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 unimpl
-:VITMAX^p xreg9 = "vit_max"(xreg0, xreg3) "(asl)" is p & op0410=0x60 & sopc0003=9 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
-:VITMAX^p xreg9 = "vit_max"(xreg0, xreg3) "(asr)" is p & op0410=0x60 & sopc0003=9 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
+# Viterbi compare-select: selects the max of 16-bit operand pairs into the dest
+# and serially records the history bits in A0 (ISR 14.2). A0 is clobbered.
+:VITMAX^p xreg9_l = "vit_max"(xreg0) "(asl)"      is p & op0410=0x60 & sopc0003=9 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 { xreg9_l = vit_max(xreg0, A0, 0:1); A0 = vit_max(xreg0, A0, 1:1); build p; }
+:VITMAX^p xreg9_l = "vit_max"(xreg0) "(asr)"      is p & op0410=0x60 & sopc0003=9 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg0 { xreg9_l = vit_max(xreg0, A0, 0:1); A0 = vit_max(xreg0, A0, 1:1); build p; }
+:VITMAX^p xreg9 = "vit_max"(xreg0, xreg3) "(asl)" is p & op0410=0x60 & sopc0003=9 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 { xreg9 = vit_max(xreg0, xreg3, A0, 0:1); A0 = vit_max(xreg0, xreg3, A0, 1:1); build p; }
+:VITMAX^p xreg9 = "vit_max"(xreg0, xreg3) "(asr)" is p & op0410=0x60 & sopc0003=9 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 { xreg9 = vit_max(xreg0, xreg3, A0, 0:1); A0 = vit_max(xreg0, xreg3, A0, 1:1); build p; }
 
-:EXTRACT^p xreg9 = "extract"(xreg0, xreg3_l) "(z)" is p & op0410=0x60 & sopc0003=10 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_l & xreg0 unimpl
-:EXTRACT^p xreg9 = "extract"(xreg0, xreg3_l) "(x)" is p & op0410=0x60 & sopc0003=10 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_l & xreg0 unimpl
-:DEPOSIT^p xreg9 = "deposit"(xreg0, xreg3)         is p & op0410=0x60 & sopc0003=10 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
-:DEPOSIT^p xreg9 = "deposit"(xreg0, xreg3) "(x)"   is p & op0410=0x60 & sopc0003=10 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
+# EXTRACT/DEPOSIT bit-field ops. Control reg (xreg3) low byte holds the field
+# length (bits 4:0) and bit position (bits 12:8). Matches binutils sim
+# (decode_dsp32shift_0: sopcde==10). EXTRACT control is Rsrc.L.
+:EXTRACT^p xreg9 = "extract"(xreg0, xreg3_l) "(z)" is p & op0410=0x60 & sopc0003=10 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_l & xreg0 {
+    local v:4 = zext(xreg3_l);
+    local len:4 = v & 0x1f;
+    local pos:4 = (v >> 8) & 0x1f;
+    local mask:4 = (1 << len) - 1;
+    xreg9 = (xreg0 >> pos) & mask;
+    build p;
+}
+:EXTRACT^p xreg9 = "extract"(xreg0, xreg3_l) "(x)" is p & op0410=0x60 & sopc0003=10 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9 & xreg3_l & xreg0 {
+    local v:4 = zext(xreg3_l);
+    local len:4 = v & 0x1f;
+    local pos:4 = (v >> 8) & 0x1f;
+    local mask:4 = (1 << len) - 1;
+    local sgn:4 = (1 << len) >> 1;
+    local x:4 = (xreg0 >> pos) & mask;
+    if ((x & sgn) == 0) goto <nosext>;
+        x = x | ~mask;
+    <nosext>
+    xreg9 = x;
+    build p;
+}
+# DEPOSIT(background = xreg0, foreground = xreg3): overlay len bits of the
+# foreground field (fg bits 31:16) into background at bit position (fg bits 12:8).
+:DEPOSIT^p xreg9 = "deposit"(xreg0, xreg3)         is p & op0410=0x60 & sopc0003=10 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 {
+    local fg:4 = xreg3;
+    local bg:4 = xreg0;
+    local len:4 = fg & 0x1f;
+    local shft:4 = (fg >> 8) & 0x1f;
+    local m16:4 = len;
+    if (len < 16) goto <okmin>;
+        m16 = 16;
+    <okmin>
+    local mask:4 = (1 << m16) - 1;
+    local fgnd:4 = ((fg >> 16) & mask) << shft;
+    mask = mask << shft;
+    xreg9 = (bg & ~mask) | fgnd;
+    build p;
+}
+:DEPOSIT^p xreg9 = "deposit"(xreg0, xreg3) "(x)"   is p & op0410=0x60 & sopc0003=10 ; xsop1415=3 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 {
+    local fg:4 = xreg3;
+    local bg:4 = xreg0;
+    local len:4 = fg & 0x1f;
+    local shft:4 = (fg >> 8) & 0x1f;
+    local sh16:4 = 16 - len;
+    local t:4 = ((fg >> 16) & 0xffff) << sh16;
+    local field:2 = t:2;
+    local fgnd:4 = sext(field) s>> sh16;
+    local mask:4 = 0xffffffff << shft;
+    fgnd = fgnd << shft;
+    xreg9 = (bg & ~mask) | fgnd;
+    build p;
+}
 
-:BXOR^p xreg9_l = "CC" = "bxorshift"(A0, xreg3) is p & op0410=0x60 & sopc0003=11 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3 & A0 unimpl
-:BXOR^p xreg9_l = "CC" = "bxor"(A0, xreg3)      is p & op0410=0x60 & sopc0003=11 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3 & A0 unimpl
-:BXOR^p A0 = "bxorshift"("A0", A1, "CC")        is p & op0410=0x60 & sopc0003=12 ; xsop1415=0 & xhls1213=0 & xreg6=0 & A0 & A1 unimpl
-:BXOR^p xreg9_l = "CC" = "bxor"(A0, A1, "CC")   is p & op0410=0x60 & sopc0003=12 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & A0 & A1 unimpl
+# Bit-wise XOR reduction of (A0 & operand) into CC; the bxorshift forms also
+# rotate the accumulator. Reduction bit modeled via bxor/bxorshift pcodeops.
+:BXOR^p xreg9_l = "CC" = "bxorshift"(A0, xreg3) is p & op0410=0x60 & sopc0003=11 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3 & A0 { local b:1 = bxorshift(A0, xreg3); CCflag = b; xreg9_l = zext(b); build p; }
+:BXOR^p xreg9_l = "CC" = "bxor"(A0, xreg3)      is p & op0410=0x60 & sopc0003=11 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & xreg3 & A0 { local b:1 = bxor(A0, xreg3); CCflag = b; xreg9_l = zext(b); build p; }
+:BXOR^p A0 = "bxorshift"("A0", A1, "CC")        is p & op0410=0x60 & sopc0003=12 ; xsop1415=0 & xhls1213=0 & xreg6=0 & A0 & A1 { A0 = bxorshift(A0, A1, CCflag); build p; }
+:BXOR^p xreg9_l = "CC" = "bxor"(A0, A1, "CC")   is p & op0410=0x60 & sopc0003=12 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9_l & A0 & A1 { local b:1 = bxor(A0, A1, CCflag); CCflag = b; xreg9_l = zext(b); build p; }
 
-:ALIGN^p xreg9 = "align8"(xreg0, xreg3)  is p & op0410=0x60 & sopc0003=13 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
-:ALIGN^p xreg9 = "align16"(xreg0, xreg3) is p & op0410=0x60 & sopc0003=13 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
-:ALIGN^p xreg9 = "align24"(xreg0, xreg3) is p & op0410=0x60 & sopc0003=13 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 unimpl
+# Byte-alignment extraction (align8/16/24): build a word from two source regs at
+# a byte offset. Modeled via the byte_align pcodeop (offset in the constant arg).
+:ALIGN^p xreg9 = "align8"(xreg0, xreg3)  is p & op0410=0x60 & sopc0003=13 ; xsop1415=0 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 { xreg9 = byte_align(xreg0, xreg3, 8:1); build p; }
+:ALIGN^p xreg9 = "align16"(xreg0, xreg3) is p & op0410=0x60 & sopc0003=13 ; xsop1415=1 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 { xreg9 = byte_align(xreg0, xreg3, 16:1); build p; }
+:ALIGN^p xreg9 = "align24"(xreg0, xreg3) is p & op0410=0x60 & sopc0003=13 ; xsop1415=2 & xhls1213=0 & xreg6=0 & xreg9 & xreg3 & xreg0 { xreg9 = byte_align(xreg0, xreg3, 24:1); build p; }
 
 
 #####
@@ -1453,15 +1831,15 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 # |.sop...|.hls...|.dest......|.imm6..................|.src.......|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-:ASH^p SHRD = SHRS >>> shift       is p & op0410=0x68 & sopc0003=0 ; xsop1415=0 &            dimm603 & SHRD & SHRS [shift = -dimm603;] unimpl
-:ASH^p SHRD = SHRS << shift "(s)"  is p & op0410=0x68 & sopc0003=0 ; xsop1415=1 & sign08=0 & dimm603 & SHRD & SHRS [shift = dimm603+0;] unimpl
-:ASH^p SHRD = SHRS >>> shift "(s)" is p & op0410=0x68 & sopc0003=0 ; xsop1415=1 & sign08=1 & dimm603 & SHRD & SHRS [shift = -dimm603;]  unimpl
-:LSH^p SHRD = SHRS << shift        is p & op0410=0x68 & sopc0003=0 ; xsop1415=2 & sign08=0 & dimm603 & SHRD & SHRS [shift = dimm603+0;]  unimpl
-:LSH^p SHRD = SHRS >> shift        is p & op0410=0x68 & sopc0003=0 ; xsop1415=2 & sign08=1 & dimm603 & SHRD & SHRS [shift = -dimm603;]   unimpl
+:ASH^p SHRD = SHRS >>> shift       is p & op0410=0x68 & sopc0003=0 ; xsop1415=0 &            dimm603 & SHRD & SHRS [shift = -dimm603;] { SHRD = SHRS s>> shift; build p; }
+:ASH^p SHRD = SHRS << shift "(s)"  is p & op0410=0x68 & sopc0003=0 ; xsop1415=1 & sign08=0 & dimm603 & SHRD & SHRS [shift = dimm603+0;] { SHRD = SHRS << shift; build p; }
+:ASH^p SHRD = SHRS >>> shift "(s)" is p & op0410=0x68 & sopc0003=0 ; xsop1415=1 & sign08=1 & dimm603 & SHRD & SHRS [shift = -dimm603;]  { SHRD = SHRS s>> shift; build p; }
+:LSH^p SHRD = SHRS << shift        is p & op0410=0x68 & sopc0003=0 ; xsop1415=2 & sign08=0 & dimm603 & SHRD & SHRS [shift = dimm603+0;]  { SHRD = SHRS << shift; build p; }
+:LSH^p SHRD = SHRS >> shift        is p & op0410=0x68 & sopc0003=0 ; xsop1415=2 & sign08=1 & dimm603 & SHRD & SHRS [shift = -dimm603;]   { SHRD = SHRS >> shift; build p; }
 
-:ASH^p xreg9 = xreg0 >>> shift "(v)"   is p & op0410=0x68 & sopc0003=1 ; xsop1415=0 & xhls1213=0 &            dimm603 & xreg9 & xreg0 [shift = -dimm603;] unimpl
-:ASH^p xreg9 = xreg0 << shift "(v,s)"  is p & op0410=0x68 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] unimpl
-:ASH^p xreg9 = xreg0 >>> shift "(v,s)" is p & op0410=0x68 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;] unimpl
+:ASH^p xreg9 = xreg0 >>> shift "(v)"   is p & op0410=0x68 & sopc0003=1 ; xsop1415=0 & xhls1213=0 &            dimm603 & xreg9 & xreg0 [shift = -dimm603;] { local th:4=xreg0>>16; local hh:2=th:2; hh=hh s>> shift; local ll:2=xreg0:2; ll=ll s>> shift; local zh:4=zext(hh); xreg9=(zh<<16)|zext(ll); build p; }
+:ASH^p xreg9 = xreg0 << shift "(v,s)"  is p & op0410=0x68 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] { local th:4=xreg0>>16; local hh:2=th:2; hh=hh<<shift; local ll:2=xreg0:2; ll=ll<<shift; local zh:4=zext(hh); xreg9=(zh<<16)|zext(ll); build p; }
+:ASH^p xreg9 = xreg0 >>> shift "(v,s)" is p & op0410=0x68 & sopc0003=1 ; xsop1415=1 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;] { local th:4=xreg0>>16; local hh:2=th:2; hh=hh s>> shift; local ll:2=xreg0:2; ll=ll s>> shift; local zh:4=zext(hh); xreg9=(zh<<16)|zext(ll); build p; }
 :LSH^p xreg9 = xreg0 << shift "(v)"
     is p & op0410=0x68 & sopc0003=1 ; xsop1415=2 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg9_l & xreg9_h & xreg0 & xreg0_l & xreg0_h
     [shift = dimm603+0;]
@@ -1485,22 +1863,59 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 :LSH^p xreg9 = xreg0 << shift        is p & op0410=0x68 & sopc0003=2 ; xsop1415=2 & xhls1213=0 & sign08=0 & dimm603 & xreg9 & xreg0 [shift = dimm603+0;] { xreg9 = xreg0 << shift; build p;}
 :LSH^p xreg9 = xreg0 >> shift        is p & op0410=0x68 & sopc0003=2 ; xsop1415=2 & xhls1213=0 & sign08=1 & dimm603 & xreg9 & xreg0 [shift = -dimm603;]  { xreg9 = xreg0 >> shift; build p;}
 :ROT^p xreg9 = "rot" xreg0 "by" 0       is p & op0410=0x68 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & dimm603=0 & xreg9 & xreg0 { xreg9 = xreg0; build p;}
-:ROT^p xreg9 = "rot" xreg0 "by" dimm603 is p & op0410=0x68 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & dimm603   & xreg9 & xreg0 unimpl
+# Rotate a 33-bit value {CC, Rsrc} left by dimm603 (negative => right), CC is
+# the 33rd bit. Matches binutils sim rot32(). dimm603 is a nonzero const here
+# (the by-0 case is the constructor above), so the sh branch constant-folds.
+:ROT^p xreg9 = "rot" xreg0 "by" dimm603 is p & op0410=0x68 & sopc0003=2 ; xsop1415=3 & xhls1213=0 & dimm603   & xreg9 & xreg0 {
+    local sh:4 = dimm603;
+    if (sh s>= 0) goto <pos>;
+        sh = sh + 33;
+    <pos>
+    local rr:8 = (zext(CCflag) << 32) | zext(xreg0);
+    rr = ((rr << sh) | (rr >> (33 - sh))) & 0x1FFFFFFFF;
+    local hibit:8 = rr >> 32;
+    CCflag = hibit:1;
+    xreg9 = rr:4;
+    build p;
+}
 
-:ASH^p A0 = "A0" >>> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & sign08=1 & dimm603 & A0 [shift = -dimm603;] unimpl
-:ASH^p A1 = "A1" >>> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & sign08=1 & dimm603 & A1 [shift = -dimm603;] unimpl
+:ASH^p A0 = "A0" >>> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & sign08=1 & dimm603 & A0 [shift = -dimm603;] { A0 = A0 s>> shift; build p; }
+:ASH^p A1 = "A1" >>> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & sign08=1 & dimm603 & A1 [shift = -dimm603;] { A1 = A1 s>> shift; build p; }
 
 # should be encoded as xsop1415=1 but the assembler from VirtualDSP 5 uses this encoding ...
-:LSH^p A0 = "A0" << shift  is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & sign08=0 & dimm603 & A0 [shift = dimm603+0;] unimpl
-:LSH^p A1 = "A1" << shift  is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & sign08=0 & dimm603 & A1 [shift = dimm603+0;] unimpl
+:LSH^p A0 = "A0" << shift  is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=0 & sign08=0 & dimm603 & A0 [shift = dimm603+0;] { A0 = A0 << shift; build p; }
+:LSH^p A1 = "A1" << shift  is p & op0410=0x68 & sopc0003=3 ; xsop1415=0 & xhls1213=1 & sign08=0 & dimm603 & A1 [shift = dimm603+0;] { A1 = A1 << shift; build p; }
 
-:LSH^p A0 = "A0" << shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=0 & sign08=0 & dimm603 & A0 [shift = dimm603+0;] unimpl
-:LSH^p A1 = "A1" << shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=1 & sign08=0 & dimm603 & A1 [shift = dimm603+0;] unimpl
-:LSH^p A0 = "A0" >> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=0 & sign08=1 & dimm603 & A0 [shift = -dimm603;] unimpl
-:LSH^p A1 = "A1" >> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=1 & sign08=1 & dimm603 & A1 [shift = -dimm603;] unimpl
+:LSH^p A0 = "A0" << shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=0 & sign08=0 & dimm603 & A0 [shift = dimm603+0;] { A0 = A0 << shift; build p; }
+:LSH^p A1 = "A1" << shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=1 & sign08=0 & dimm603 & A1 [shift = dimm603+0;] { A1 = A1 << shift; build p; }
+:LSH^p A0 = "A0" >> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=0 & sign08=1 & dimm603 & A0 [shift = -dimm603;] { A0 = A0 >> shift; build p; }
+:LSH^p A1 = "A1" >> shift is p & op0410=0x68 & sopc0003=3 ; xsop1415=1 & xhls1213=1 & sign08=1 & dimm603 & A1 [shift = -dimm603;] { A1 = A1 >> shift; build p; }
 
-:ROT^p A0 = "rot" "A0" "by" dimm603 is p & op0410=0x68 & sopc0003=3 ; xsop1415=2 & xhls1213=0 & dimm603 & A0  unimpl
-:ROT^p A1 = "rot" "A1" "by" dimm603 is p & op0410=0x68 & sopc0003=3 ; xsop1415=2 & xhls1213=1 & dimm603 & A1  unimpl
+# 41-bit rotate-through-CC of {CC, A[39:0]}, immediate count (negative => right).
+:ROT^p A0 = "rot" "A0" "by" dimm603 is p & op0410=0x68 & sopc0003=3 ; xsop1415=2 & xhls1213=0 & dimm603 & A0 {
+    local sh:4 = dimm603;
+    if (sh s>= 0) goto <pos>;
+        sh = sh + 41;
+    <pos>
+    local rr:8 = (zext(CCflag) << 40) | (A0 & 0xffffffffff);
+    rr = ((rr << sh) | (rr >> (41 - sh))) & 0x1FFFFFFFFFF;
+    local hibit:8 = rr >> 40;
+    CCflag = hibit:1;
+    A0 = rr & 0xffffffffff;
+    build p;
+}
+:ROT^p A1 = "rot" "A1" "by" dimm603 is p & op0410=0x68 & sopc0003=3 ; xsop1415=2 & xhls1213=1 & dimm603 & A1 {
+    local sh:4 = dimm603;
+    if (sh s>= 0) goto <pos>;
+        sh = sh + 41;
+    <pos>
+    local rr:8 = (zext(CCflag) << 40) | (A1 & 0xffffffffff);
+    rr = ((rr << sh) | (rr >> (41 - sh))) & 0x1FFFFFFFFFF;
+    local hibit:8 = rr >> 40;
+    CCflag = hibit:1;
+    A1 = rr & 0xffffffffff;
+    build p;
+}
 
 
 @ifdef BLACKFIN_PLUS
@@ -1554,11 +1969,12 @@ SHRS: xreg0_h is xh12=1 & xreg0_h { export xreg0_h; }
 # |.dummy.(0).....................................................|
 # +---+---+---+---|---+---+---+---|---+---+---+---|---+---+---+---+
 
-:JUMP.a value is op16=0xdc00 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
-:JUMP   value is op16=0xdc01 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
-:CALL.a value is op16=0xde00 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
-:CALL   value is op16=0xde01 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] unimpl
-# TODO: P-Code Implementation
+# Blackfin+ 32-bit-immediate jump/call. The immediate is the target address;
+# modeled as an absolute branch/call (value built from the two immediate halves).
+:JUMP.a value is op16=0xdc00 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] { local t:4 = value; goto [t]; }
+:JUMP   value is op16=0xdc01 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] { local t:4 = value; goto [t]; }
+:CALL.a value is op16=0xde00 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] { RETS = inst_next; local t:4 = value; call [t]; }
+:CALL   value is op16=0xde01 ; uimm16; yuimm16; zuimm16=0 [value = uimm16 << 16 | yuimm16;] { RETS = inst_next; local t:4 = value; call [t]; }
 
 @endif
 

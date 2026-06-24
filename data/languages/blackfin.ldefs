@@ -6,7 +6,7 @@
             endian="little"
             size="32"
             variant="default"
-            version="1.0"
+            version="1.1"
             slafile="blackfin.sla"
             processorspec="blackfin.pspec"
             id="blackfin:LE:32:default">
@@ -18,7 +18,7 @@
             endian="little"
             size="32"
             variant="Blackfin+"
-            version="1.0"
+            version="1.1"
             slafile="blackfinplus.sla"
             processorspec="blackfin.pspec"
             id="blackfin:LE:32:blackfin+">
@@ -30,7 +30,7 @@
             endian="little"
             size="32"
             variant="BF52x"
-            version="1.0"
+            version="1.1"
             slafile="blackfin.sla"
             processorspec="bf52x.pspec"
             id="blackfin:LE:32:BF52x">
